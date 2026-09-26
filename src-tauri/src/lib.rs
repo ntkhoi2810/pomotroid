@@ -2,6 +2,7 @@ pub mod audio;
 pub mod commands;
 pub mod db;
 pub mod notifications;
+pub mod plants;
 pub mod settings;
 pub mod shortcuts;
 pub mod themes;
@@ -24,6 +25,7 @@ use commands::{
     audio_clear_custom, audio_get_custom_info, audio_set_custom,
     get_log_dir, open_log_dir,
     notification_show,
+    plants_list, plants_select, forest_get,
     settings_get, settings_reset_defaults, settings_set,
     shortcuts_reload,
     sessions_clear,
@@ -135,6 +137,12 @@ pub fn run() {
                 initial_settings.clone(),
                 Arc::clone(&tray_state),
                 db.clone(),
+                {
+                    let conn = db.lock().unwrap();
+                    settings::get_setting(&conn, "selected_plant_id")
+                        .filter(|id| plants::growth_stage(id, initial_settings.time_work_secs).is_some())
+                        .unwrap_or_else(|| plants::DEFAULT_PLANT_ID.to_string())
+                },
             );
             app.manage(timer);
 
@@ -373,6 +381,9 @@ pub fn run() {
             timer_restart_round,
             timer_skip,
             timer_get_state,
+            plants_list,
+            plants_select,
+            forest_get,
             // Settings
             settings_get,
             settings_set,

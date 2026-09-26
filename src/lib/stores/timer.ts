@@ -14,6 +14,8 @@ const initial: TimerState = {
   work_round_number: 1,
   work_rounds_total: 4,
   session_work_count: 1,
+  selected_plant_id: 'clover',
+  active_plant_id: null,
 };
 
 export const timerState = writable<TimerState>(initial);

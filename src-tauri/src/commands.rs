@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use crate::audio::{self, AudioManager};
 use crate::notifications;
+use crate::plants::{self, PlantDefinition};
 use crate::db::{queries, DbState};
 use crate::settings::{self, Settings};
 use crate::shortcuts;
@@ -52,6 +53,50 @@ pub fn timer_restart_round(timer: State<'_, TimerController>) {
 #[tauri::command]
 pub fn timer_get_state(timer: State<'_, TimerController>) -> TimerSnapshot {
     timer.get_snapshot()
+}
+
+// ---------------------------------------------------------------------------
+// Plants and forest
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn plants_list() -> Vec<PlantDefinition> {
+    plants::catalog()
+}
+
+#[tauri::command]
+pub fn plants_select(
+    plant_id: String,
+    db: State<'_, DbState>,
+    timer: State<'_, TimerController>,
+) -> Result<TimerSnapshot, String> {
+    if !plants::is_valid(&plant_id) {
+        return Err(format!("unknown plant: '{plant_id}'"));
+    }
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    let current_settings = settings::load(&conn).map_err(|e| e.to_string())?;
+    if plants::growth_stage(&plant_id, current_settings.time_work_secs).is_none() {
+        return Err(format!(
+            "plant '{plant_id}' requires a longer focus duration"
+        ));
+    }
+    settings::save_setting(&conn, "selected_plant_id", &plant_id).map_err(|e| e.to_string())?;
+    drop(conn);
+    timer.select_plant(plant_id);
+    Ok(timer.get_snapshot())
+}
+
+#[tauri::command]
+pub fn forest_get(
+    period: String,
+    anchor: Option<String>,
+    db: State<'_, DbState>,
+) -> Result<queries::ForestData, String> {
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    queries::get_forest(&conn, &period, anchor.as_deref()).map_err(|e| {
+        log::error!("[forest] failed to query {period}: {e}");
+        e.to_string()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +160,14 @@ pub fn settings_set(
 
     // Keep the timer engine in sync when time-related settings change.
     timer.apply_settings(new_settings.clone());
+    let selected_plant_id = timer.get_snapshot().selected_plant_id;
+    if plants::growth_stage(&selected_plant_id, new_settings.time_work_secs).is_none() {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        settings::save_setting(&conn, "selected_plant_id", plants::DEFAULT_PLANT_ID)
+            .map_err(|e| e.to_string())?;
+        drop(conn);
+        timer.select_plant(plants::DEFAULT_PLANT_ID.to_string());
+    }
 
     // Broadcast an updated snapshot so the frontend immediately reflects any
     // changed settings (round count, durations, etc.) regardless of timer
@@ -251,6 +304,7 @@ pub fn settings_reset_defaults(
     };
 
     timer.apply_settings(new_settings.clone());
+    timer.select_plant(plants::DEFAULT_PLANT_ID.to_string());
     *tray_state.countdown_mode.lock().unwrap() = new_settings.dial_countdown;
 
     // Broadcast a reset snapshot so the frontend dial and display reflect the

@@ -38,6 +38,10 @@ pub struct TimerSnapshot {
     /// Monotonically-increasing focus round count since last reset. Used as a
     /// session counter when long breaks are disabled.
     pub session_work_count: u32,
+    /// Plant chosen for the next focus round.
+    pub selected_plant_id: String,
+    /// Plant locked to the currently active focus round.
+    pub active_plant_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -47,6 +51,7 @@ pub struct TimerSnapshot {
 struct TimerShared {
     elapsed_secs: u32,
     is_running: bool,
+    active_plant_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +63,7 @@ pub struct TimerController {
     sequence: Arc<Mutex<SequenceState>>,
     settings: Arc<Mutex<Settings>>,
     shared: Arc<Mutex<TimerShared>>,
+    selected_plant: Arc<Mutex<String>>,
     /// Kept alive so TrayState is not dropped if lib.rs forgets its copy.
     #[allow(dead_code)]
     tray: Arc<TrayState>,
@@ -71,6 +77,7 @@ impl TimerController {
         settings: Settings,
         tray: Arc<TrayState>,
         db: DbState,
+        selected_plant_id: String,
     ) -> Self {
         let seq = SequenceState::new(settings.long_break_interval);
         let duration = seq.current_duration_secs(&settings);
@@ -82,12 +89,15 @@ impl TimerController {
         let shared = Arc::new(Mutex::new(TimerShared {
             elapsed_secs: 0,
             is_running: false,
+            active_plant_id: None,
         }));
+        let selected_plant = Arc::new(Mutex::new(selected_plant_id));
 
         // Clone handles for the event-listener thread.
         let seq_thread = Arc::clone(&sequence);
         let settings_thread = Arc::clone(&settings_arc);
         let shared_thread = Arc::clone(&shared);
+        let selected_plant_thread = Arc::clone(&selected_plant);
         let engine_thread = engine.clone();
         let tray_thread = Arc::clone(&tray);
 
@@ -101,6 +111,7 @@ impl TimerController {
                         sequence: seq_thread,
                         settings: settings_thread,
                         shared: shared_thread,
+                        selected_plant: selected_plant_thread,
                         engine: engine_thread,
                         tray: tray_thread,
                         db,
@@ -114,6 +125,7 @@ impl TimerController {
             sequence,
             settings: settings_arc,
             shared,
+            selected_plant,
             tray,
         }
     }
@@ -182,6 +194,7 @@ impl TimerController {
         let seq = self.sequence.lock().unwrap();
         let settings = self.settings.lock().unwrap();
         let shared = self.shared.lock().unwrap();
+        let selected_plant = self.selected_plant.lock().unwrap();
 
         TimerSnapshot {
             round_type: seq.current_round.as_str().to_string(),
@@ -193,7 +206,13 @@ impl TimerController {
             work_round_number: seq.work_round_number,
             work_rounds_total: seq.work_rounds_total,
             session_work_count: seq.session_work_count,
+            selected_plant_id: selected_plant.clone(),
+            active_plant_id: shared.active_plant_id.clone(),
         }
+    }
+
+    pub fn select_plant(&self, plant_id: String) {
+        *self.selected_plant.lock().unwrap() = plant_id;
     }
 
     /// Apply new settings values. Updates the in-memory copy and, if the
@@ -226,6 +245,7 @@ struct ListenContext {
     sequence: Arc<Mutex<SequenceState>>,
     settings: Arc<Mutex<Settings>>,
     shared: Arc<Mutex<TimerShared>>,
+    selected_plant: Arc<Mutex<String>>,
     engine: EngineHandle,
     tray: Arc<TrayState>,
     db: DbState,
@@ -236,7 +256,7 @@ fn listen_events(
     event_rx: std::sync::mpsc::Receiver<TimerEvent>,
     ctx: ListenContext,
 ) {
-    let ListenContext { sequence, settings, shared, engine, tray, db } = ctx;
+    let ListenContext { sequence, settings, shared, selected_plant, engine, tray, db } = ctx;
     // Track last tray progress to throttle redraws to ≥ 1% delta.
     let mut last_tray_progress: f32 = -1.0;
     // Active session row ID for recording (None = not started yet).
@@ -246,8 +266,18 @@ fn listen_events(
         match event {
             TimerEvent::Started { total_secs } => {
                 log::info!("[timer] started total={total_secs}s");
-                shared.lock().unwrap().is_running = true;
-                let _ = app.emit("timer:started", serde_json::json!({ "total_secs": total_secs }));
+                let is_work = sequence.lock().unwrap().current_round == RoundType::Work;
+                {
+                    let mut state = shared.lock().unwrap();
+                    state.is_running = true;
+                    state.active_plant_id = if is_work {
+                        Some(selected_plant.lock().unwrap().clone())
+                    } else {
+                        None
+                    };
+                }
+                let snapshot = build_snapshot(&sequence, &settings, &shared, &selected_plant);
+                let _ = app.emit("timer:started", snapshot);
                 if let Some(ws) = app.try_state::<Arc<WsState>>() {
                     websocket::broadcast_started(&ws, total_secs);
                 }
@@ -268,13 +298,14 @@ fn listen_events(
                 // --- Session recording: start on first tick of a new round ---
                 if elapsed_secs == 1 && current_session_id.is_none() {
                     let rt = sequence.lock().unwrap().current_round.as_str().to_string();
-                    let total = {
-                        let seq = sequence.lock().unwrap();
-                        let s = settings.lock().unwrap();
-                        seq.current_duration_secs(&s)
+                    let plant_id = if rt == "work" {
+                        shared.lock().unwrap().active_plant_id.clone()
+                            .filter(|id| crate::plants::growth_stage(id, total_secs).is_some())
+                    } else {
+                        None
                     };
                     if let Ok(conn) = db.lock() {
-                        match queries::insert_session(&conn, &rt, total) {
+                        match queries::insert_session(&conn, &rt, total_secs, plant_id.as_deref()) {
                             Ok(id) => current_session_id = Some(id),
                             Err(e) => log::error!("[timer] failed to record session: {e}"),
                         }
@@ -327,6 +358,7 @@ fn listen_events(
                     let mut s = shared.lock().unwrap();
                     s.elapsed_secs = 0;
                     s.is_running = false;
+                    s.active_plant_id = None;
                 }
 
                 // Arm the next round's duration without risking a late
@@ -336,7 +368,7 @@ fn listen_events(
                 });
 
                 // Emit round-change with the new snapshot.
-                let snapshot = build_snapshot(&sequence, &settings, &shared);
+                let snapshot = build_snapshot(&sequence, &settings, &shared, &selected_plant);
                 let _ = app.emit("timer:round-change", snapshot);
 
                 // Desktop notifications are dispatched by the frontend via the
@@ -378,7 +410,7 @@ fn listen_events(
 
                 // Broadcast round-change to any connected WebSocket clients.
                 if let Some(ws) = app.try_state::<Arc<WsState>>() {
-                    let snap = build_snapshot(&sequence, &settings, &shared);
+                    let snap = build_snapshot(&sequence, &settings, &shared, &selected_plant);
                     websocket::broadcast_round_change(&ws, snap);
                 }
 
@@ -448,8 +480,9 @@ fn listen_events(
                     let mut s = shared.lock().unwrap();
                     s.elapsed_secs = 0;
                     s.is_running = false;
+                    s.active_plant_id = None;
                 }
-                let snapshot = build_snapshot(&sequence, &settings, &shared);
+                let snapshot = build_snapshot(&sequence, &settings, &shared, &selected_plant);
                 let _ = app.emit("timer:reset", snapshot);
                 if let Some(ws) = app.try_state::<Arc<WsState>>() {
                     websocket::broadcast_reset(&ws);
@@ -500,10 +533,12 @@ fn build_snapshot(
     sequence: &Arc<Mutex<SequenceState>>,
     settings: &Arc<Mutex<Settings>>,
     shared: &Arc<Mutex<TimerShared>>,
+    selected_plant: &Arc<Mutex<String>>,
 ) -> TimerSnapshot {
     let seq = sequence.lock().unwrap();
     let s = settings.lock().unwrap();
     let sh = shared.lock().unwrap();
+    let plant = selected_plant.lock().unwrap();
 
     TimerSnapshot {
         round_type: seq.current_round.as_str().to_string(),
@@ -515,5 +550,7 @@ fn build_snapshot(
         work_round_number: seq.work_round_number,
         work_rounds_total: seq.work_rounds_total,
         session_work_count: seq.session_work_count,
+        selected_plant_id: plant.clone(),
+        active_plant_id: sh.active_plant_id.clone(),
     }
 }

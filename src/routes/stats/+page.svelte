@@ -25,10 +25,11 @@
   import DailyView from '$lib/components/stats/DailyView.svelte';
   import WeeklyView from '$lib/components/stats/WeeklyView.svelte';
   import YearlyView from '$lib/components/stats/YearlyView.svelte';
+  import ForestView from '$lib/components/stats/ForestView.svelte';
 
-  type Tab = 'today' | 'week' | 'alltime';
+  type Tab = 'forest' | 'today' | 'week' | 'alltime';
 
-  let activeTab = $state<Tab>('today');
+  let activeTab = $state<Tab>('forest');
   let detailed = $state<DetailedStats | null>(null);
   let heatmap = $state<HeatmapStats | null>(null);
   let heatmapLoaded = $state(false);
@@ -160,6 +161,9 @@
 
   <!-- Tab bar -->
   <div class="tabs">
+    <button class="tab" class:active={activeTab === 'forest'} onclick={() => switchTab('forest')}
+      >{m.stats_tab_forest()}</button
+    >
     <button class="tab" class:active={activeTab === 'today'} onclick={() => switchTab('today')}
       >{m.stats_tab_today()}</button
     >
@@ -173,7 +177,9 @@
 
   <!-- Content -->
   <div class="content">
-    {#if activeTab === 'today'}
+    {#if activeTab === 'forest'}
+      <ForestView />
+    {:else if activeTab === 'today'}
       <DailyView today={detailed?.today ?? null} />
     {:else if activeTab === 'week'}
       <WeeklyView week={detailed?.week ?? null} streak={detailed?.streak ?? null} />

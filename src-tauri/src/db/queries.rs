@@ -11,12 +11,13 @@ pub fn insert_session(
     conn: &Connection,
     round_type: &str,
     duration_secs: u32,
+    plant_id: Option<&str>,
 ) -> Result<i64> {
     let started_at = unix_now();
     conn.execute(
-        "INSERT INTO sessions (started_at, round_type, duration_secs, completed)
-         VALUES (?1, ?2, ?3, 0)",
-        params![started_at, round_type, duration_secs],
+        "INSERT INTO sessions (started_at, round_type, duration_secs, completed, plant_id)
+         VALUES (?1, ?2, ?3, 0, ?4)",
+        params![started_at, round_type, duration_secs, plant_id],
     )?;
     let id = conn.last_insert_rowid();
     log::debug!("[db] session started: id={id} type={round_type} duration={duration_secs}s");
@@ -29,12 +30,108 @@ pub fn complete_session(
     session_id: i64,
     completed: bool,
 ) -> Result<()> {
+    let plant: Option<(String, u32)> = conn
+        .query_row(
+            "SELECT plant_id, duration_secs FROM sessions WHERE id = ?1 AND plant_id IS NOT NULL",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+    let growth_stage = if completed {
+        plant
+            .as_ref()
+            .and_then(|(id, duration)| crate::plants::growth_stage(id, *duration))
+    } else {
+        None
+    };
     conn.execute(
-        "UPDATE sessions SET ended_at = ?1, completed = ?2 WHERE id = ?3",
-        params![unix_now(), completed as i64, session_id],
+        "UPDATE sessions SET ended_at = ?1, completed = ?2, growth_stage = ?3 WHERE id = ?4",
+        params![unix_now(), completed as i64, growth_stage, session_id],
     )?;
     log::debug!("[db] session ended: id={session_id} completed={completed}");
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+pub struct ForestEntry {
+    pub session_id: i64,
+    pub plant_id: String,
+    pub growth_stage: String,
+    pub duration_secs: u32,
+    pub planted_at: i64,
+    pub local_date: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ForestData {
+    pub period: String,
+    pub start_date: String,
+    pub end_date: String,
+    pub total_focus_secs: u32,
+    pub entries: Vec<ForestEntry>,
+}
+
+/// Returns completed focus plants in a local-calendar day, week, or month.
+pub fn get_forest(conn: &Connection, period: &str, anchor: Option<&str>) -> Result<ForestData> {
+    let anchor = anchor.unwrap_or("now");
+    let (start_modifier, end_modifier) = match period {
+        "day" => ("start of day", "+1 day"),
+        "week" => ("weekday 0", "+7 days"),
+        "month" => ("start of month", "+1 month"),
+        _ => return Err(rusqlite::Error::InvalidParameterName(period.to_string())),
+    };
+
+    let start_date: String = if period == "week" {
+        // Move to the coming Sunday, then step back to Monday of this week.
+        conn.query_row(
+            "SELECT date(?1, 'weekday 0', '-6 days')",
+            [anchor],
+            |row| row.get(0),
+        )?
+    } else {
+        conn.query_row(
+            "SELECT date(?1, ?2)",
+            params![anchor, start_modifier],
+            |row| row.get(0),
+        )?
+    };
+    let end_date: String = conn.query_row(
+        "SELECT date(?1, ?2)",
+        params![&start_date, end_modifier],
+        |row| row.get(0),
+    )?;
+
+    let mut stmt = conn.prepare(
+        "SELECT id, plant_id, growth_stage, duration_secs, ended_at,
+                date(ended_at, 'unixepoch', 'localtime')
+         FROM sessions
+         WHERE round_type = 'work' AND completed = 1
+           AND plant_id IS NOT NULL AND growth_stage IS NOT NULL
+           AND date(ended_at, 'unixepoch', 'localtime') >= ?1
+           AND date(ended_at, 'unixepoch', 'localtime') < ?2
+         ORDER BY ended_at",
+    )?;
+    let entries: Vec<ForestEntry> = stmt
+        .query_map(params![&start_date, &end_date], |row| {
+            Ok(ForestEntry {
+                session_id: row.get(0)?,
+                plant_id: row.get(1)?,
+                growth_stage: row.get(2)?,
+                duration_secs: row.get(3)?,
+                planted_at: row.get(4)?,
+                local_date: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    let total_focus_secs = entries.iter().map(|entry| entry.duration_secs).sum();
+
+    Ok(ForestData {
+        period: period.to_string(),
+        start_date,
+        end_date,
+        total_focus_secs,
+        entries,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +407,7 @@ mod tests {
     #[test]
     fn insert_and_complete_session() {
         let conn = setup();
-        let id = insert_session(&conn, "work", 1500).unwrap();
+        let id = insert_session(&conn, "work", 1500, None).unwrap();
         assert!(id > 0);
 
         complete_session(&conn, id, true).unwrap();
@@ -405,21 +502,21 @@ mod tests {
         let conn = setup();
 
         // 339 s = 5:39 → rounds up to 6 min (remainder 39 ≥ 30).
-        let id1 = insert_session(&conn, "work", 339).unwrap();
+        let id1 = insert_session(&conn, "work", 339, None).unwrap();
         complete_session(&conn, id1, true).unwrap();
         let stats = get_daily_stats(&conn).unwrap();
         assert_eq!(stats.focus_mins, 6, "339 s should round to 6 min");
 
         // Reset and test round-down: 324 s = 5:24 → rounds down to 5 min (remainder 24 < 30).
         let conn2 = setup();
-        let id2 = insert_session(&conn2, "work", 324).unwrap();
+        let id2 = insert_session(&conn2, "work", 324, None).unwrap();
         complete_session(&conn2, id2, true).unwrap();
         let stats2 = get_daily_stats(&conn2).unwrap();
         assert_eq!(stats2.focus_mins, 5, "324 s should round to 5 min");
 
         // Exact minute boundary: 1500 s = 25:00 → stays 25 min.
         let conn3 = setup();
-        let id3 = insert_session(&conn3, "work", 1500).unwrap();
+        let id3 = insert_session(&conn3, "work", 1500, None).unwrap();
         complete_session(&conn3, id3, true).unwrap();
         let stats3 = get_daily_stats(&conn3).unwrap();
         assert_eq!(stats3.focus_mins, 25, "1500 s should be exactly 25 min");
@@ -429,17 +526,37 @@ mod tests {
     fn stats_counts_correctly() {
         let conn = setup();
 
-        let id1 = insert_session(&conn, "work", 1500).unwrap();
+        let id1 = insert_session(&conn, "work", 1500, None).unwrap();
         complete_session(&conn, id1, true).unwrap();
 
-        let id2 = insert_session(&conn, "work", 1500).unwrap();
+        let id2 = insert_session(&conn, "work", 1500, None).unwrap();
         complete_session(&conn, id2, false).unwrap(); // skipped
 
-        let _id3 = insert_session(&conn, "short-break", 300).unwrap();
+        let _id3 = insert_session(&conn, "short-break", 300, None).unwrap();
 
         let stats = get_all_time_stats(&conn).unwrap();
         assert_eq!(stats.total_work_sessions, 2);
         assert_eq!(stats.completed_work_sessions, 1);
         assert_eq!(stats.total_work_secs, 1500);
+    }
+
+    #[test]
+    fn forest_only_contains_completed_eligible_plants() {
+        let conn = setup();
+
+        let planted = insert_session(&conn, "work", 1500, Some("cherry")).unwrap();
+        complete_session(&conn, planted, true).unwrap();
+
+        let skipped = insert_session(&conn, "work", 3600, Some("oak")).unwrap();
+        complete_session(&conn, skipped, false).unwrap();
+
+        let too_short = insert_session(&conn, "work", 300, Some("oak")).unwrap();
+        complete_session(&conn, too_short, true).unwrap();
+
+        let forest = get_forest(&conn, "day", None).unwrap();
+        assert_eq!(forest.entries.len(), 1);
+        assert_eq!(forest.entries[0].plant_id, "cherry");
+        assert_eq!(forest.entries[0].growth_stage, "medium");
+        assert_eq!(forest.total_focus_secs, 1500);
     }
 }

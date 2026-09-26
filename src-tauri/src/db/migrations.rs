@@ -90,6 +90,17 @@ const MIGRATION_6: &str = "
     INSERT INTO schema_version VALUES (6);
 ";
 
+/// Adds the plant snapshot attached to a focus session. Existing sessions stay
+/// null and therefore remain part of numeric stats without appearing as trees.
+const MIGRATION_7: &str = "
+    ALTER TABLE sessions ADD COLUMN plant_id TEXT;
+    ALTER TABLE sessions ADD COLUMN growth_stage TEXT
+        CHECK(growth_stage IS NULL OR growth_stage IN ('small', 'medium', 'large'));
+    CREATE INDEX IF NOT EXISTS idx_sessions_forest
+        ON sessions(completed, round_type, ended_at, plant_id);
+    INSERT INTO schema_version VALUES (7);
+";
+
 /// Apply any pending migrations. Each migration is wrapped in a transaction
 /// so a partial failure leaves the database unchanged.
 pub fn run(conn: &Connection) -> Result<()> {
@@ -131,6 +142,12 @@ pub fn run(conn: &Connection) -> Result<()> {
         log::info!("[db/migrations] MIGRATION_6 complete");
     }
 
+    if version < 7 {
+        log::info!("[db/migrations] applying MIGRATION_7: add focus plants");
+        conn.execute_batch(&format!("BEGIN; {MIGRATION_7} COMMIT;"))?;
+        log::info!("[db/migrations] MIGRATION_7 complete");
+    }
+
     Ok(())
 }
 
@@ -166,7 +183,7 @@ mod tests {
         let v: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 6);
+        assert_eq!(v, 7);
     }
 
     #[test]

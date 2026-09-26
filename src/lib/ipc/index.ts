@@ -12,6 +12,9 @@ import type {
   DetailedStats,
   HeatmapStats,
   UpdateInfo,
+  PlantDefinition,
+  ForestData,
+  ForestPeriod,
 } from '$lib/types';
 
 // --- Timer commands ---
@@ -21,6 +24,13 @@ export const timerReset = () => invoke<void>('timer_reset');
 export const timerRestartRound = () => invoke<void>('timer_restart_round');
 export const timerSkip = () => invoke<void>('timer_skip');
 export const getTimerState = () => invoke<TimerState>('timer_get_state');
+
+// --- Plants and forest ---
+
+export const getPlants = () => invoke<PlantDefinition[]>('plants_list');
+export const selectPlant = (plantId: string) => invoke<TimerState>('plants_select', { plantId });
+export const getForest = (period: ForestPeriod, anchor?: string) =>
+  invoke<ForestData>('forest_get', { period, anchor: anchor ?? null });
 
 // --- Settings commands ---
 
@@ -109,6 +119,9 @@ export const onTimerTick = (
   cb: (payload: { elapsed_secs: number; total_secs: number }) => void
 ): Promise<UnlistenFn> =>
   listen<{ elapsed_secs: number; total_secs: number }>('timer:tick', (e) => cb(e.payload));
+
+export const onTimerStarted = (cb: (state: TimerState) => void): Promise<UnlistenFn> =>
+  listen<TimerState>('timer:started', (e) => cb(e.payload));
 
 export const onTimerPaused = (
   cb: (payload: { elapsed_secs: number }) => void

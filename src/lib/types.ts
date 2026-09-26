@@ -14,6 +14,36 @@ export interface TimerState {
   work_round_number: number; // current work round (1-based)
   work_rounds_total: number; // total work rounds before long break
   session_work_count: number; // monotonic focus round count since last reset
+  selected_plant_id: string; // selection for the next focus round
+  active_plant_id: string | null; // locked plant for the active focus round
+}
+
+export type GrowthStage = 'small' | 'medium' | 'large';
+export type ForestPeriod = 'day' | 'week' | 'month';
+
+export interface PlantDefinition {
+  id: string;
+  name: string;
+  category: string;
+  min_focus_secs: number;
+  accent: string;
+}
+
+export interface ForestEntry {
+  session_id: number;
+  plant_id: string;
+  growth_stage: GrowthStage;
+  duration_secs: number;
+  planted_at: number;
+  local_date: string;
+}
+
+export interface ForestData {
+  period: ForestPeriod;
+  start_date: string;
+  end_date: string; // exclusive
+  total_focus_secs: number;
+  entries: ForestEntry[];
 }
 
 /** Mirrors Rust `Settings` struct returned by `settings_get`. */

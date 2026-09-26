@@ -270,6 +270,8 @@ mod tests {
             work_round_number: 1,
             work_rounds_total: 4,
             session_work_count: 1,
+            selected_plant_id: "clover".to_string(),
+            active_plant_id: None,
         }
     }
 
