@@ -27,16 +27,15 @@
   import { settings } from '$lib/stores/settings';
   import { timerState } from '$lib/stores/timer';
   import { applyTheme } from '$lib/stores/theme';
-  import type { MotionActivity, PlantDefinition, WeatherType } from '$lib/types';
+  import type { MotionActivity, PlantDefinition } from '$lib/types';
   import { resolveThemeName } from '$lib/utils/theme';
+  import { weatherForSession } from '$lib/utils/weather';
   import { setLocale } from '$lib/locale.svelte.js';
   import * as m from '$paraglide/messages.js';
 
-  const WEATHER_TYPES: WeatherType[] = ['sunny', 'rain', 'wind', 'storm'];
-
   let plants = $state<PlantDefinition[]>([]);
-  let weather = $state<WeatherType>('sunny');
   let snapshot = $derived($timerState);
+  let weather = $derived(weatherForSession(snapshot.session_work_count));
   let displayPlantId = $derived(snapshot.active_plant_id ?? snapshot.selected_plant_id);
   let displayPlant = $derived(plants.find((plant) => plant.id === displayPlantId));
   let growthProgress = $derived(
@@ -59,10 +58,6 @@
   let motionActivity = $derived<MotionActivity>(
     snapshot.is_running ? 'running' : snapshot.is_paused ? 'paused' : 'idle'
   );
-
-  function randomizeWeather() {
-    weather = WEATHER_TYPES[Math.floor(Math.random() * WEATHER_TYPES.length)];
-  }
 
   function formatTime(seconds: number): string {
     const mins = Math.floor(seconds / 60);
@@ -101,7 +96,6 @@
       timerState.set(currentTimer);
       plants = catalog;
       setLocale(currentSettings.language);
-      if (currentTimer.round_type === 'work') randomizeWeather();
       await applyCurrentTheme();
 
       const colorScheme = window.matchMedia('(prefers-color-scheme: dark)');
@@ -138,10 +132,7 @@
             is_paused: false,
           }));
         }),
-        await onRoundChange((state) => {
-          timerState.set(state);
-          if (state.round_type === 'work') randomizeWeather();
-        }),
+        await onRoundChange((state) => timerState.set(state)),
         await onTimerReset((state) => timerState.set(state)),
         await onTimerDurationAdjusted((state) => timerState.set(state)),
         await onPlantsChanged((catalog) => (plants = catalog)),
@@ -165,7 +156,7 @@
     data-weather={weather}
     data-tauri-drag-region
   >
-    <WeatherScene {weather} activity={motionActivity} compact />
+    <WeatherScene {weather} activity={motionActivity} />
     <div class="hill hill-back" data-tauri-drag-region></div>
     <div class="hill hill-front" data-tauri-drag-region></div>
 

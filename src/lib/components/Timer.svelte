@@ -22,7 +22,8 @@
   } from '$lib/ipc';
   import { timerState } from '$lib/stores/timer';
   import { settings } from '$lib/stores/settings';
-  import type { MotionActivity, PlantDefinition, WeatherType } from '$lib/types';
+  import type { MotionActivity, PlantDefinition } from '$lib/types';
+  import { weatherForSession } from '$lib/utils/weather';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import * as m from '$paraglide/messages.js';
   import PlantIllustration from './PlantIllustration.svelte';
@@ -30,8 +31,6 @@
   import WeatherScene from './WeatherScene.svelte';
 
   const MAX_ROUNDS = 12;
-  const WEATHER_TYPES: WeatherType[] = ['sunny', 'rain', 'wind', 'storm'];
-
   interface Props {
     isCompact?: boolean;
     uiScale?: number;
@@ -43,9 +42,9 @@
   let showClock = $state(true);
   let selecting = $state(false);
   let showManager = $state(false);
-  let weather = $state<WeatherType>('sunny');
   let updatingRounds = $state(false);
   let snapshot = $derived($timerState);
+  let weather = $derived(weatherForSession(snapshot.session_work_count));
   let selectedPlant = $derived(plants.find((plant) => plant.id === snapshot.selected_plant_id));
   let displayPlantId = $derived(snapshot.active_plant_id ?? snapshot.selected_plant_id);
   let displayPlant = $derived(plants.find((plant) => plant.id === displayPlantId));
@@ -73,10 +72,6 @@
   let motionActivity = $derived<MotionActivity>(
     snapshot.is_running ? 'running' : snapshot.is_paused ? 'paused' : 'idle'
   );
-
-  function randomizeWeather() {
-    weather = WEATHER_TYPES[Math.floor(Math.random() * WEATHER_TYPES.length)];
-  }
 
   function minimumRoundTotal() {
     if (snapshot.round_type === 'long-break') return 1;
@@ -141,7 +136,6 @@
       const [initial, catalog] = await Promise.all([getTimerState(), getPlants()]);
       timerState.set(initial);
       plants = catalog;
-      if (initial.round_type === 'work') randomizeWeather();
 
       cleanups.push(
         await onTimerStarted((snapshot) => timerState.set(snapshot)),
@@ -172,7 +166,6 @@
         }),
         await onRoundChange((snapshot) => {
           timerState.set(snapshot);
-          if (snapshot.round_type === 'work') randomizeWeather();
           if (!$settings.notifications_enabled) return;
           if (snapshot.round_type === 'work') {
             const afterBreak = ['short-break', 'long-break'].includes(snapshot.previous_round_type);
