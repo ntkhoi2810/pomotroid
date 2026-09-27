@@ -221,6 +221,9 @@
     inset: 9px;
     padding: 14px;
     overflow: hidden;
+    display: flex;
+    min-height: 0;
+    flex-direction: column;
     border-radius: 20px;
     color: var(--color-foreground);
     background: color-mix(in oklch, var(--color-background-light) 96%, #000);
@@ -266,9 +269,10 @@
     cursor: pointer;
   }
   .list {
-    height: 322px;
+    min-height: 0;
+    flex: 1;
     margin-top: 9px;
-    overflow: auto;
+    overflow-y: auto;
     display: flex;
     flex-direction: column;
     gap: 6px;
