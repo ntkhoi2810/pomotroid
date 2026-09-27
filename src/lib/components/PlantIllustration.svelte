@@ -241,6 +241,10 @@
     animation-name: sway-rest;
     animation-duration: 6.8s;
   }
+  .plant[data-category='tree'] .weather-motion {
+    animation: none;
+    transform: none;
+  }
   @keyframes sway-sunny {
     0%,
     100% {
