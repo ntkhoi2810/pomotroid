@@ -94,3 +94,15 @@ body {
     transform: scale(1);
   }
 }
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+  }
+
+  .app {
+    animation: none !important;
+  }
+}

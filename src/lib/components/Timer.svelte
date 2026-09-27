@@ -13,6 +13,7 @@
     onTimerDurationAdjusted,
     onPlantsChanged,
     selectPlant,
+    setSetting,
     timerReset,
     timerRestartRound,
     timerSkip,
@@ -21,11 +22,15 @@
   } from '$lib/ipc';
   import { timerState } from '$lib/stores/timer';
   import { settings } from '$lib/stores/settings';
-  import type { PlantDefinition } from '$lib/types';
+  import type { MotionActivity, PlantDefinition, WeatherType } from '$lib/types';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import * as m from '$paraglide/messages.js';
   import PlantIllustration from './PlantIllustration.svelte';
   import PlantManager from './PlantManager.svelte';
+  import WeatherScene from './WeatherScene.svelte';
+
+  const MAX_ROUNDS = 12;
+  const WEATHER_TYPES: WeatherType[] = ['sunny', 'rain', 'wind', 'storm'];
 
   interface Props {
     isCompact?: boolean;
@@ -38,6 +43,8 @@
   let showClock = $state(true);
   let selecting = $state(false);
   let showManager = $state(false);
+  let weather = $state<WeatherType>('sunny');
+  let updatingRounds = $state(false);
   let snapshot = $derived($timerState);
   let selectedPlant = $derived(plants.find((plant) => plant.id === snapshot.selected_plant_id));
   let displayPlantId = $derived(snapshot.active_plant_id ?? snapshot.selected_plant_id);
@@ -63,6 +70,32 @@
   let plantEligibilitySecs = $derived(
     selectingNext ? $settings.time_work_secs : snapshot.total_secs
   );
+  let motionActivity = $derived<MotionActivity>(
+    snapshot.is_running ? 'running' : snapshot.is_paused ? 'paused' : 'idle'
+  );
+
+  function randomizeWeather() {
+    weather = WEATHER_TYPES[Math.floor(Math.random() * WEATHER_TYPES.length)];
+  }
+
+  function minimumRoundTotal() {
+    if (snapshot.round_type === 'long-break') return 1;
+    if (snapshot.round_type === 'short-break') return snapshot.work_round_number + 1;
+    return Math.max(1, snapshot.work_round_number);
+  }
+
+  async function changeRoundTotal(delta: number) {
+    if (updatingRounds) return;
+    const minimum = minimumRoundTotal();
+    const next = Math.max(minimum, Math.min(MAX_ROUNDS, snapshot.work_rounds_total + delta));
+    if (next === snapshot.work_rounds_total) return;
+    updatingRounds = true;
+    try {
+      settings.set(await setSetting('work_rounds', String(next)));
+    } finally {
+      updatingRounds = false;
+    }
+  }
 
   function formatTime(seconds: number): string {
     const mins = Math.floor(seconds / 60);
@@ -108,6 +141,7 @@
       const [initial, catalog] = await Promise.all([getTimerState(), getPlants()]);
       timerState.set(initial);
       plants = catalog;
+      if (initial.round_type === 'work') randomizeWeather();
 
       cleanups.push(
         await onTimerStarted((snapshot) => timerState.set(snapshot)),
@@ -138,6 +172,7 @@
         }),
         await onRoundChange((snapshot) => {
           timerState.set(snapshot);
+          if (snapshot.round_type === 'work') randomizeWeather();
           if (!$settings.notifications_enabled) return;
           if (snapshot.round_type === 'work') {
             const afterBreak = ['short-break', 'long-break'].includes(snapshot.previous_round_type);
@@ -168,10 +203,8 @@
 </script>
 
 <div class="timer-shell" class:compact={isCompact} style="zoom: {uiScale}">
-  <section class="garden" class:resting={snapshot.round_type !== 'work'}>
-    <div class="sky-glow"></div>
-    <div class="cloud cloud-one"></div>
-    <div class="cloud cloud-two"></div>
+  <section class="garden" class:resting={snapshot.round_type !== 'work'} data-weather={weather}>
+    <WeatherScene {weather} activity={motionActivity} compact={isCompact} />
     <div class="hill hill-back"></div>
     <div class="hill hill-front"></div>
 
@@ -234,6 +267,9 @@
           iconPath={displayIconPath}
           {progress}
           label={displayPlant?.name}
+          category={displayPlant?.category}
+          {weather}
+          activity={motionActivity}
         />
       </div>
     {/if}
@@ -288,7 +324,22 @@
 
     {#if !isCompact}
       <footer>
-        <span>{snapshot.work_round_number}/{snapshot.work_rounds_total}</span>
+        <div class="round-stepper">
+          <button
+            onclick={() => changeRoundTotal(-1)}
+            disabled={updatingRounds || snapshot.work_rounds_total <= minimumRoundTotal()}
+            aria-label={`${m.timer_slider_rounds()}: −`}>−</button
+          >
+          <span
+            aria-label={`${m.timer_slider_rounds()}: ${snapshot.work_round_number}/${snapshot.work_rounds_total}`}
+            >{snapshot.work_round_number}/{snapshot.work_rounds_total}</span
+          >
+          <button
+            onclick={() => changeRoundTotal(1)}
+            disabled={updatingRounds || snapshot.work_rounds_total >= MAX_ROUNDS}
+            aria-label={`${m.timer_slider_rounds()}: +`}>+</button
+          >
+        </div>
         <button onclick={timerReset}>{m.timer_reset()}</button>
       </footer>
     {/if}
@@ -355,19 +406,23 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    border-radius: 24px;
-    background: color-mix(in oklch, var(--color-background-light) 55%, var(--color-background));
-    box-shadow: 0 18px 55px color-mix(in oklch, #000 25%, transparent);
+    border: 1px solid color-mix(in oklch, var(--color-foreground) 8%, transparent);
+    border-radius: 30px;
+    background: color-mix(in oklch, var(--color-background-light) 62%, var(--color-background));
+    box-shadow:
+      0 24px 60px color-mix(in oklch, #000 24%, transparent),
+      inset 0 1px 0 color-mix(in oklch, var(--color-foreground) 9%, transparent);
   }
   .garden {
     position: relative;
     height: 292px;
     overflow: hidden;
     background: linear-gradient(
-      160deg,
+      155deg,
       color-mix(in oklch, var(--color-short-round) 38%, var(--color-background)) 0%,
       color-mix(in oklch, var(--color-accent) 18%, var(--color-background-light)) 100%
     );
+    transition: background 0.8s ease;
   }
   .garden.resting {
     background: linear-gradient(
@@ -376,69 +431,30 @@
       var(--color-background-light) 100%
     );
   }
-  .sky-glow {
-    position: absolute;
-    width: 150px;
-    height: 150px;
-    right: -45px;
-    top: -55px;
-    border-radius: 50%;
-    background: color-mix(in oklch, #fff7c2 22%, transparent);
-    filter: blur(2px);
-  }
-  .cloud {
-    position: absolute;
-    width: 45px;
-    height: 10px;
-    border-radius: 20px;
-    background: color-mix(in oklch, var(--color-foreground) 15%, transparent);
-  }
-  .cloud::before,
-  .cloud::after {
-    content: '';
-    position: absolute;
-    border-radius: 50%;
-    background: inherit;
-  }
-  .cloud::before {
-    width: 18px;
-    height: 18px;
-    left: 8px;
-    bottom: 0;
-  }
-  .cloud::after {
-    width: 13px;
-    height: 13px;
-    left: 24px;
-    bottom: 0;
-  }
-  .cloud-one {
-    top: 65px;
-    left: 25px;
-  }
-  .cloud-two {
-    top: 92px;
-    right: 30px;
-    transform: scale(0.7);
-  }
   .hill {
     position: absolute;
-    border-radius: 50% 50% 0 0;
-    bottom: -55px;
+    z-index: 1;
+    border-radius: 52% 62% 0 0 / 68% 74% 0 0;
+    bottom: -58px;
+    transition: background 0.8s ease;
   }
   .hill-back {
-    width: 330px;
-    height: 135px;
-    left: -110px;
+    width: 350px;
+    height: 142px;
+    left: -125px;
     background: color-mix(in oklch, var(--color-short-round) 52%, var(--color-background));
-    transform: rotate(5deg);
+    transform: rotate(4deg);
   }
   .hill-front {
-    width: 360px;
-    height: 120px;
-    right: -130px;
+    width: 378px;
+    height: 126px;
+    right: -142px;
     background: color-mix(in oklch, var(--color-short-round) 68%, var(--color-background));
-    transform: rotate(-4deg);
+    transform: rotate(-3deg);
+  }
+  .garden[data-weather='rain'] .hill,
+  .garden[data-weather='storm'] .hill {
+    filter: saturate(0.78) brightness(0.86);
   }
   .garden-header {
     position: relative;
@@ -473,6 +489,13 @@
     color: inherit;
     background: color-mix(in oklch, var(--color-background) 28%, transparent);
     cursor: pointer;
+    transition:
+      transform var(--transition-snappy),
+      background var(--transition-default);
+  }
+  .icon-button:hover {
+    transform: translateY(-1px);
+    background: color-mix(in oklch, var(--color-background) 40%, transparent);
   }
   .icon-button svg {
     width: 16px;
@@ -509,6 +532,14 @@
     background: color-mix(in oklch, var(--color-background) 30%, transparent);
     font: 700 9px/1 'Mona Sans';
     cursor: pointer;
+    transition:
+      transform var(--transition-snappy),
+      opacity var(--transition-default),
+      background var(--transition-default);
+  }
+  .time-adjust:not(:disabled):hover {
+    transform: translateY(-1px);
+    background: color-mix(in oklch, var(--color-background) 44%, transparent);
   }
   .time-adjust:disabled {
     opacity: 0.35;
@@ -523,14 +554,6 @@
     bottom: 19px;
     transform: translateX(-50%);
   }
-  .plant-stage.growing {
-    animation: breathe 3s ease-in-out infinite;
-  }
-  @keyframes breathe {
-    50% {
-      transform: translateX(-50%) translateY(-2px);
-    }
-  }
   .soil-line {
     position: absolute;
     z-index: 2;
@@ -540,7 +563,12 @@
     bottom: 8px;
     transform: translateX(-50%);
     border-radius: 50%;
-    background: color-mix(in oklch, #6b4933 52%, var(--color-background));
+    background: radial-gradient(
+      ellipse at center,
+      color-mix(in oklch, #8b654f 68%, var(--color-background)) 0%,
+      color-mix(in oklch, #5d4638 48%, transparent) 72%
+    );
+    filter: blur(0.2px);
   }
   .progress-track {
     position: absolute;
@@ -564,6 +592,11 @@
     grid-template-columns: 1fr auto;
     align-items: center;
     gap: 5px 8px;
+    background: linear-gradient(
+      155deg,
+      color-mix(in oklch, var(--color-background-light) 82%, transparent),
+      color-mix(in oklch, var(--color-background) 68%, transparent)
+    );
   }
   .plant-choice {
     min-width: 0;
@@ -575,6 +608,12 @@
     gap: 9px;
     text-align: left;
     cursor: pointer;
+    border-radius: 14px;
+    padding: 4px;
+    transition: background var(--transition-default);
+  }
+  .plant-choice:hover {
+    background: var(--color-hover);
   }
   .plant-choice > span:nth-child(2) {
     min-width: 0;
@@ -604,7 +643,7 @@
     flex: 0 0 auto;
     width: 25px;
     height: 25px;
-    border-radius: 9px 9px 12px 12px;
+    border-radius: 46% 54% 58% 42% / 42% 46% 54% 58%;
     background: var(--seed-color);
     box-shadow: inset -5px -5px 0 color-mix(in oklch, #000 12%, transparent);
   }
@@ -619,6 +658,16 @@
     place-items: center;
     cursor: pointer;
     color: inherit;
+    transition:
+      transform var(--transition-snappy),
+      box-shadow var(--transition-default),
+      background var(--transition-default);
+  }
+  .controls button:not(:disabled):hover {
+    transform: translateY(-1px);
+  }
+  .controls button:not(:disabled):active {
+    transform: translateY(0) scale(0.96);
   }
   .controls svg {
     width: 18px;
@@ -635,15 +684,17 @@
     border-radius: 50%;
     background: var(--color-accent);
     color: var(--color-background) !important;
-    box-shadow: 0 5px 16px color-mix(in oklch, var(--color-accent) 35%, transparent);
+    box-shadow:
+      0 7px 19px color-mix(in oklch, var(--color-accent) 32%, transparent),
+      inset 0 1px 0 color-mix(in oklch, #fff 24%, transparent);
   }
   .main-control svg {
     fill: currentColor;
     stroke: none;
   }
   .side-control {
-    width: 29px;
-    height: 29px;
+    width: 32px;
+    height: 32px;
     border-radius: 50%;
     background: var(--color-hover);
   }
@@ -655,6 +706,40 @@
     color: var(--color-foreground-darker);
     font-size: 9px;
   }
+  .round-stepper {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px;
+    border-radius: 999px;
+    background: color-mix(in oklch, var(--color-foreground) 7%, transparent);
+  }
+  .round-stepper span {
+    min-width: 28px;
+    text-align: center;
+    font-family: 'Mona Sans Mono', monospace;
+    font-weight: 650;
+  }
+  .timer-shell footer .round-stepper button {
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    background: color-mix(in oklch, var(--color-foreground) 8%, transparent);
+    font-size: 13px;
+    line-height: 1;
+    transition:
+      background var(--transition-default),
+      opacity var(--transition-default);
+  }
+  .timer-shell footer .round-stepper button:not(:disabled):hover {
+    background: color-mix(in oklch, var(--color-accent) 24%, transparent);
+  }
+  .timer-shell footer .round-stepper button:disabled {
+    opacity: 0.28;
+    cursor: not-allowed;
+  }
   .timer-shell footer button {
     border: 0;
     background: none;
@@ -663,6 +748,10 @@
     cursor: pointer;
     text-transform: uppercase;
     letter-spacing: 0.08em;
+  }
+  .timer-shell button:focus-visible {
+    outline: 2px solid color-mix(in oklch, var(--color-accent) 78%, #fff);
+    outline-offset: 2px;
   }
   .picker-backdrop {
     position: absolute;
@@ -800,5 +889,16 @@
   }
   .compact .plant-grid {
     height: 150px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .timer-shell,
+    .garden,
+    .hill,
+    .progress-track span,
+    .icon-button,
+    .time-adjust,
+    .controls button {
+      transition-duration: 0.01ms !important;
+    }
   }
 </style>

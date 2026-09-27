@@ -1,6 +1,8 @@
 // Shared TypeScript types mirroring Rust structs (must stay in sync with Rust serde output).
 
 export type RoundType = 'work' | 'short-break' | 'long-break';
+export type WeatherType = 'sunny' | 'rain' | 'wind' | 'storm';
+export type MotionActivity = 'running' | 'paused' | 'idle';
 
 /** Mirrors Rust `TimerSnapshot` — emitted via timer:tick / timer:round-change events
  *  and returned by the `timer_get_state` IPC command. */
