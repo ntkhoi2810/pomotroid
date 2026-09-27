@@ -8,9 +8,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use std::sync::Arc;
 
 use crate::audio::{self, AudioManager};
-use crate::notifications;
-use crate::plants::{self, PlantDefinition};
 use crate::db::{queries, DbState};
+use crate::notifications;
+use crate::plants::{self, PlantDefinition, PlantInput};
 use crate::settings::{self, Settings};
 use crate::shortcuts;
 use crate::themes::{self, Theme};
@@ -55,32 +55,152 @@ pub fn timer_get_state(timer: State<'_, TimerController>) -> TimerSnapshot {
     timer.get_snapshot()
 }
 
+#[tauri::command]
+pub fn timer_adjust_duration(
+    delta_secs: i32,
+    timer: State<'_, TimerController>,
+) -> Result<(), String> {
+    timer.adjust_duration(delta_secs)
+}
+
 // ---------------------------------------------------------------------------
 // Plants and forest
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn plants_list() -> Vec<PlantDefinition> {
-    plants::catalog()
+pub fn plants_list(
+    include_hidden: Option<bool>,
+    db: State<'_, DbState>,
+) -> Result<Vec<PlantDefinition>, String> {
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    plants::list(&conn, include_hidden.unwrap_or(false)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn plants_save(
+    input: PlantInput,
+    db: State<'_, DbState>,
+    timer: State<'_, TimerController>,
+    app: AppHandle,
+) -> Result<PlantDefinition, String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    let old_paths = input
+        .id
+        .as_deref()
+        .map(|id| plants::find(&conn, id))
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .into_iter()
+        .flat_map(|plant| {
+            [
+                plant.small_icon_path,
+                plant.medium_icon_path,
+                plant.large_icon_path,
+            ]
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    let plant = plants::save(&conn, input, &data_dir)?;
+    plants::remove_unreferenced_files(&conn, old_paths);
+    clear_invalid_selected_plant(&conn, &timer)?;
+    let visible = plants::list(&conn, false).map_err(|e| e.to_string())?;
+    drop(conn);
+    app.emit("plants:changed", visible).ok();
+    app.emit("timer:reset", timer.get_snapshot()).ok();
+    Ok(plant)
+}
+
+#[tauri::command]
+pub fn plants_set_hidden(
+    plant_id: String,
+    hidden: bool,
+    db: State<'_, DbState>,
+    timer: State<'_, TimerController>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    plants::set_hidden(&conn, &plant_id, hidden)?;
+    clear_invalid_selected_plant(&conn, &timer)?;
+    let visible = plants::list(&conn, false).map_err(|e| e.to_string())?;
+    drop(conn);
+    app.emit("plants:changed", visible).ok();
+    app.emit("timer:reset", timer.get_snapshot()).ok();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn plants_restore_default(
+    plant_id: String,
+    db: State<'_, DbState>,
+    timer: State<'_, TimerController>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    let old_paths = plants::restore_default(&conn, &plant_id)?;
+    plants::remove_unreferenced_files(&conn, old_paths);
+    clear_invalid_selected_plant(&conn, &timer)?;
+    let visible = plants::list(&conn, false).map_err(|e| e.to_string())?;
+    drop(conn);
+    app.emit("plants:changed", visible).ok();
+    app.emit("timer:reset", timer.get_snapshot()).ok();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn plants_delete(
+    plant_id: String,
+    db: State<'_, DbState>,
+    timer: State<'_, TimerController>,
+    app: AppHandle,
+) -> Result<(), String> {
+    if timer.get_snapshot().active_plant_id.as_deref() == Some(&plant_id) {
+        return Err("the active plant cannot be deleted".to_string());
+    }
+    let conn = db.lock().map_err(|e| e.to_string())?;
+    let old_paths = plants::delete_custom(&conn, &plant_id)?;
+    plants::remove_unreferenced_files(&conn, old_paths);
+    clear_invalid_selected_plant(&conn, &timer)?;
+    let visible = plants::list(&conn, false).map_err(|e| e.to_string())?;
+    drop(conn);
+    app.emit("plants:changed", visible).ok();
+    app.emit("timer:reset", timer.get_snapshot()).ok();
+    Ok(())
 }
 
 #[tauri::command]
 pub fn plants_select(
-    plant_id: String,
+    plant_id: Option<String>,
     db: State<'_, DbState>,
     timer: State<'_, TimerController>,
 ) -> Result<TimerSnapshot, String> {
-    if !plants::is_valid(&plant_id) {
-        return Err(format!("unknown plant: '{plant_id}'"));
-    }
     let conn = db.lock().map_err(|e| e.to_string())?;
-    let current_settings = settings::load(&conn).map_err(|e| e.to_string())?;
-    if plants::growth_stage(&plant_id, current_settings.time_work_secs).is_none() {
-        return Err(format!(
-            "plant '{plant_id}' requires a longer focus duration"
-        ));
+    if let Some(id) = plant_id.as_deref() {
+        let plant = plants::find(&conn, id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("unknown plant: '{id}'"))?;
+        if plant.hidden {
+            return Err(format!("plant '{id}' is hidden"));
+        }
+        let snapshot = timer.get_snapshot();
+        let available_secs = if snapshot.active_plant_id.is_some() {
+            settings::load(&conn)
+                .map_err(|e| e.to_string())?
+                .time_work_secs
+        } else {
+            snapshot.total_secs
+        };
+        if plants::growth_stage(&plant, available_secs).is_none() {
+            return Err(format!("plant '{id}' requires a longer focus duration"));
+        }
     }
-    settings::save_setting(&conn, "selected_plant_id", &plant_id).map_err(|e| e.to_string())?;
+    settings::save_setting(
+        &conn,
+        "selected_plant_id",
+        plant_id.as_deref().unwrap_or(""),
+    )
+    .map_err(|e| e.to_string())?;
     drop(conn);
     timer.select_plant(plant_id);
     Ok(timer.get_snapshot())
@@ -139,7 +259,8 @@ pub fn settings_set(
         // restore from.
         if key == "tray_icon_enabled" && value == "false" {
             settings::save_setting(&conn, "min_to_tray", "false").map_err(|e| e.to_string())?;
-            settings::save_setting(&conn, "min_to_tray_on_close", "false").map_err(|e| e.to_string())?;
+            settings::save_setting(&conn, "min_to_tray_on_close", "false")
+                .map_err(|e| e.to_string())?;
         }
         settings::load(&conn).map_err(|e| {
             log::error!("[settings] failed to reload after save: {e}");
@@ -160,13 +281,9 @@ pub fn settings_set(
 
     // Keep the timer engine in sync when time-related settings change.
     timer.apply_settings(new_settings.clone());
-    let selected_plant_id = timer.get_snapshot().selected_plant_id;
-    if plants::growth_stage(&selected_plant_id, new_settings.time_work_secs).is_none() {
+    {
         let conn = db.lock().map_err(|e| e.to_string())?;
-        settings::save_setting(&conn, "selected_plant_id", plants::DEFAULT_PLANT_ID)
-            .map_err(|e| e.to_string())?;
-        drop(conn);
-        timer.select_plant(plants::DEFAULT_PLANT_ID.to_string());
+        clear_invalid_selected_plant(&conn, &timer)?;
     }
 
     // Broadcast an updated snapshot so the frontend immediately reflects any
@@ -188,8 +305,8 @@ pub fn settings_set(
         if let Some(window) = app.get_webview_window("main") {
             let snap = timer.get_snapshot();
             let is_break = snap.round_type != "work";
-            let effective_aot = new_settings.always_on_top
-                && !(new_settings.break_always_on_top && is_break);
+            let effective_aot =
+                new_settings.always_on_top && !(new_settings.break_always_on_top && is_break);
             let _ = window.set_always_on_top(effective_aot);
         }
     }
@@ -248,7 +365,14 @@ pub fn settings_set(
     }
 
     // Re-register global shortcuts when any shortcut key changes or the enabled flag toggles.
-    if matches!(key.as_str(), "shortcut_toggle" | "shortcut_reset" | "shortcut_skip" | "shortcut_restart" | "global_shortcuts_enabled") {
+    if matches!(
+        key.as_str(),
+        "shortcut_toggle"
+            | "shortcut_reset"
+            | "shortcut_skip"
+            | "shortcut_restart"
+            | "global_shortcuts_enabled"
+    ) {
         shortcuts::register_all(&app, &new_settings);
     }
 
@@ -294,17 +418,31 @@ pub fn settings_reset_defaults(
     app: AppHandle,
 ) -> Result<Settings, String> {
     log::info!("[settings] reset to defaults");
-    let new_settings = {
+    let (new_settings, selected_plant_id) = {
         let conn = db.lock().map_err(|e| e.to_string())?;
         // Delete all rows so seed_defaults can insert fresh defaults.
         conn.execute("DELETE FROM settings", [])
             .map_err(|e| e.to_string())?;
         settings::seed_defaults(&conn).map_err(|e| e.to_string())?;
-        settings::load(&conn).map_err(|e| e.to_string())?
+        let reset_settings = settings::load(&conn).map_err(|e| e.to_string())?;
+        let selected = plants::find(&conn, plants::DEFAULT_PLANT_ID)
+            .map_err(|e| e.to_string())?
+            .filter(|plant| {
+                !plant.hidden
+                    && plants::growth_stage(plant, reset_settings.time_work_secs).is_some()
+            })
+            .map(|plant| plant.id);
+        settings::save_setting(
+            &conn,
+            "selected_plant_id",
+            selected.as_deref().unwrap_or(""),
+        )
+        .map_err(|e| e.to_string())?;
+        (reset_settings, selected)
     };
 
     timer.apply_settings(new_settings.clone());
-    timer.select_plant(plants::DEFAULT_PLANT_ID.to_string());
+    timer.select_plant(selected_plant_id);
     *tray_state.countdown_mode.lock().unwrap() = new_settings.dial_countdown;
 
     // Broadcast a reset snapshot so the frontend dial and display reflect the
@@ -360,10 +498,7 @@ pub fn settings_reset_defaults(
 /// List all available themes (17 bundled + any user-created ones).
 #[tauri::command]
 pub fn themes_list(app: AppHandle) -> Result<Vec<Theme>, String> {
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?;
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     Ok(themes::list_all(&data_dir))
 }
 
@@ -405,7 +540,11 @@ pub fn stats_get_detailed(db: State<'_, DbState>) -> Result<DetailedStats, Strin
         log::error!("[stats] failed to query streak: {e}");
         e.to_string()
     })?;
-    Ok(DetailedStats { today, week, streak })
+    Ok(DetailedStats {
+        today,
+        week,
+        streak,
+    })
 }
 
 /// Heatmap data + lifetime totals for the All Time tab.
@@ -487,10 +626,7 @@ pub fn audio_set_custom(
     std::fs::create_dir_all(&audio_dir).map_err(|e| e.to_string())?;
 
     let src = std::path::Path::new(&src_path);
-    let ext = src
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("mp3");
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("mp3");
 
     // Remove any existing custom file for this slot (preserves zero orphans).
     if let Ok(entries) = std::fs::read_dir(&audio_dir) {
@@ -564,8 +700,11 @@ pub fn audio_clear_custom(
     // Remove the persisted display name.
     let name_key = cue_to_name_key(&cue)?;
     let conn = db.lock().map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM settings WHERE key = ?1", rusqlite::params![name_key])
-        .map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM settings WHERE key = ?1",
+        rusqlite::params![name_key],
+    )
+    .map_err(|e| e.to_string())?;
 
     log::info!("[audio] custom sound cleared cue={cue}");
     Ok(())
@@ -592,7 +731,8 @@ pub fn audio_get_custom_info(
         settings::get_setting(&conn, key).or_else(|| stored.clone())
     };
     info.work_alert = override_name(&info.work_alert, "custom_work_alert_name");
-    info.short_break_alert = override_name(&info.short_break_alert, "custom_short_break_alert_name");
+    info.short_break_alert =
+        override_name(&info.short_break_alert, "custom_short_break_alert_name");
     info.long_break_alert = override_name(&info.long_break_alert, "custom_long_break_alert_name");
 
     Ok(info)
@@ -780,6 +920,31 @@ fn cue_to_name_key(cue: &str) -> Result<&'static str, String> {
     }
 }
 
+fn clear_invalid_selected_plant(
+    conn: &rusqlite::Connection,
+    timer: &TimerController,
+) -> Result<(), String> {
+    let snapshot = timer.get_snapshot();
+    let Some(id) = snapshot.selected_plant_id else {
+        return Ok(());
+    };
+    let duration = if snapshot.active_plant_id.is_some() {
+        settings::load(conn)
+            .map_err(|e| e.to_string())?
+            .time_work_secs
+    } else {
+        snapshot.total_secs
+    };
+    let valid = plants::find(conn, &id)
+        .map_err(|e| e.to_string())?
+        .is_some_and(|plant| !plant.hidden && plants::growth_stage(&plant, duration).is_some());
+    if !valid {
+        settings::save_setting(conn, "selected_plant_id", "").map_err(|e| e.to_string())?;
+        timer.select_plant(None);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Stats payload types
 // ---------------------------------------------------------------------------
@@ -803,8 +968,8 @@ pub struct HeatmapStats {
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::Connection;
     use crate::db::migrations;
+    use rusqlite::Connection;
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -813,24 +978,31 @@ mod tests {
     }
 
     fn seed_sessions(conn: &Connection) {
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             INSERT INTO sessions (started_at, ended_at, round_type, duration_secs, completed)
             VALUES (1000, 1060, 'work', 60, 1),
                    (2000, 2300, 'short-break', 300, 1);
-        ").unwrap();
+        ",
+        )
+        .unwrap();
     }
 
     #[test]
     fn sessions_clear_removes_all_rows() {
         let conn = setup();
         seed_sessions(&conn);
-        let before: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(before, 2);
 
         let n = conn.execute("DELETE FROM sessions", []).unwrap();
         assert_eq!(n, 2);
 
-        let after: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(after, 0);
     }
 
@@ -841,4 +1013,3 @@ mod tests {
         assert_eq!(n, 0);
     }
 }
-

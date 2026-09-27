@@ -87,6 +87,31 @@
     });
   }
 
+  async function openPip() {
+    const existing = await WebviewWindow.getByLabel('pip');
+    if (existing) {
+      await existing.show();
+      await existing.setFocus();
+      return;
+    }
+    new WebviewWindow('pip', {
+      url: '/pip',
+      title: 'Pomotroid Timer',
+      width: 230,
+      height: 112,
+      minWidth: 230,
+      minHeight: 112,
+      maxWidth: 230,
+      maxHeight: 112,
+      decorations: false,
+      alwaysOnTop: true,
+      resizable: false,
+      skipTaskbar: true,
+      visible: false,
+      focus: true,
+    });
+  }
+
   async function minimize() {
     suppressRestoredTitlebarState();
     if ($settings.min_to_tray) {
@@ -178,18 +203,39 @@
   </Tooltip>
 {/snippet}
 
+{#snippet pipBtn()}
+  <Tooltip text={m.tooltip_pip()}>
+    <button class="btn-icon" onclick={openPip} aria-label={m.tooltip_pip()}>
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+        <rect
+          x="1.5"
+          y="2.5"
+          width="13"
+          height="11"
+          rx="2"
+          stroke="currentColor"
+          stroke-width="1.3"
+        />
+        <rect x="7.5" y="7.5" width="5" height="3.5" rx="0.8" fill="currentColor" />
+      </svg>
+    </button>
+  </Tooltip>
+{/snippet}
+
 <nav class="titlebar" class:suppress-hover={suppressTitlebarHover} data-tauri-drag-region>
   <!-- Left: settings + stats buttons on Linux/Windows. On macOS the traffic
        lights live here; the action buttons move to the right side instead. -->
   {#if !isMac}
     {@render settingsBtn()}
     {@render statsBtn()}
+    {@render pipBtn()}
   {/if}
 
   <!-- Right: settings + stats buttons on macOS, window controls on Linux/Windows. -->
   <div class="controls">
     {#if isMac}
       {@render statsBtn()}
+      {@render pipBtn()}
       {@render settingsBtn()}
     {:else}
       <button class="btn-icon" onclick={minimize} aria-label="Minimize">
@@ -246,11 +292,7 @@
           </svg>
         {/if}
       </button>
-      <button
-        class="btn-icon close"
-        onclick={close}
-        aria-label="Close"
-      >
+      <button class="btn-icon close" onclick={close} aria-label="Close">
         <svg width="12" height="12" viewBox="0 0 12 12">
           <line
             x1="1"

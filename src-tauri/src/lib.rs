@@ -17,21 +17,12 @@ use tauri::Manager;
 use tauri_plugin_log::{Builder as LogBuilder, RotationStrategy, Target, TargetKind};
 
 use commands::{
-    accessibility_trusted,
-    tray_supported,
-    app_version,
-    check_update,
-    install_update,
-    audio_clear_custom, audio_get_custom_info, audio_set_custom,
-    get_log_dir, open_log_dir,
-    notification_show,
-    plants_list, plants_select, forest_get,
-    settings_get, settings_reset_defaults, settings_set,
-    shortcuts_reload,
-    sessions_clear,
-    stats_get_detailed, stats_get_heatmap,
-    themes_list,
-    timer_get_state, timer_reset, timer_restart_round, timer_skip, timer_toggle,
+    accessibility_trusted, app_version, audio_clear_custom, audio_get_custom_info,
+    audio_set_custom, check_update, forest_get, get_log_dir, install_update, notification_show,
+    open_log_dir, plants_delete, plants_list, plants_restore_default, plants_save, plants_select,
+    plants_set_hidden, sessions_clear, settings_get, settings_reset_defaults, settings_set,
+    shortcuts_reload, stats_get_detailed, stats_get_heatmap, themes_list, timer_adjust_duration,
+    timer_get_state, timer_reset, timer_restart_round, timer_skip, timer_toggle, tray_supported,
     window_set_visibility,
 };
 
@@ -62,8 +53,7 @@ pub fn run() {
                 .app_data_dir()
                 .expect("failed to resolve app data directory");
 
-            std::fs::create_dir_all(&app_data_dir)
-                .expect("failed to create app data directory");
+            std::fs::create_dir_all(&app_data_dir).expect("failed to create app data directory");
 
             // --- Database ---
             let db = match db::open(&app_data_dir) {
@@ -117,7 +107,8 @@ pub fn run() {
                 _ => &initial_settings.theme_light,
             };
             if let Some(theme) = themes::find(&app_data_dir, tray_theme_name) {
-                *tray_state.colors.lock().unwrap() = tray::TrayColors::from_colors_map(&theme.colors);
+                *tray_state.colors.lock().unwrap() =
+                    tray::TrayColors::from_colors_map(&theme.colors);
             }
 
             // --- Audio engine (optional — graceful if no audio device) ---
@@ -139,9 +130,30 @@ pub fn run() {
                 db.clone(),
                 {
                     let conn = db.lock().unwrap();
-                    settings::get_setting(&conn, "selected_plant_id")
-                        .filter(|id| plants::growth_stage(id, initial_settings.time_work_secs).is_some())
-                        .unwrap_or_else(|| plants::DEFAULT_PLANT_ID.to_string())
+                    match settings::get_setting(&conn, "selected_plant_id") {
+                        None => Some(plants::DEFAULT_PLANT_ID.to_string()),
+                        Some(id) if id.is_empty() => None,
+                        Some(id) => {
+                            let valid =
+                                plants::find(&conn, &id)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|plant| {
+                                        !plant.hidden
+                                            && plants::growth_stage(
+                                                &plant,
+                                                initial_settings.time_work_secs,
+                                            )
+                                            .is_some()
+                                    });
+                            if valid {
+                                Some(id)
+                            } else {
+                                let _ = settings::save_setting(&conn, "selected_plant_id", "");
+                                None
+                            }
+                        }
+                    }
                 },
             );
             app.manage(timer);
@@ -170,10 +182,9 @@ pub fn run() {
             // --- Theme hot-reload watcher ---
             // The watcher must stay alive for the duration of the app.
             // Wrap in a Mutex so it satisfies Send + Sync for Tauri manage.
-            if let Some(watcher) = themes::watcher::spawn_watcher(
-                app_data_dir.clone(),
-                app.handle().clone(),
-            ) {
+            if let Some(watcher) =
+                themes::watcher::spawn_watcher(app_data_dir.clone(), app.handle().clone())
+            {
                 app.manage(std::sync::Mutex::new(watcher));
             }
 
@@ -228,8 +239,7 @@ pub fn run() {
                     if let RawWindowHandle::AppKit(h) = handle.as_raw() {
                         let ns_view = h.ns_view.as_ptr() as *mut AnyObject;
                         // SAFETY: ns_view is a valid NSView* supplied by Tauri/WRY.
-                        let ns_window: *mut AnyObject =
-                            unsafe { msg_send![ns_view, window] };
+                        let ns_window: *mut AnyObject = unsafe { msg_send![ns_view, window] };
 
                         // NSWindowCollectionBehaviorManaged        = 1 << 2  (tiling)
                         // NSWindowCollectionBehaviorFullScreenPrimary = 1 << 10 (full-screen)
@@ -246,31 +256,25 @@ pub fn run() {
                                 std::ffi::CStr::from_bytes_with_nul_unchecked(b"NSApplication\0"),
                             );
                             if let Some(cls) = ns_app_class {
-                                let ns_app: *mut AnyObject =
-                                    msg_send![cls, sharedApplication];
-                                let main_menu: *mut AnyObject =
-                                    msg_send![ns_app, mainMenu];
+                                let ns_app: *mut AnyObject = msg_send![cls, sharedApplication];
+                                let main_menu: *mut AnyObject = msg_send![ns_app, mainMenu];
                                 if !main_menu.is_null() {
-                                    let count: isize =
-                                        msg_send![main_menu, numberOfItems];
+                                    let count: isize = msg_send![main_menu, numberOfItems];
                                     for i in 0..count {
                                         let item: *mut AnyObject =
                                             msg_send![main_menu, itemAtIndex: i];
-                                        let submenu: *mut AnyObject =
-                                            msg_send![item, submenu];
+                                        let submenu: *mut AnyObject = msg_send![item, submenu];
                                         if submenu.is_null() {
                                             continue;
                                         }
-                                        let title: *mut AnyObject =
-                                            msg_send![item, title];
+                                        let title: *mut AnyObject = msg_send![item, title];
                                         let utf8: *const std::ffi::c_char =
                                             msg_send![title, UTF8String];
                                         if utf8.is_null() {
                                             continue;
                                         }
-                                        let s = std::ffi::CStr::from_ptr(utf8)
-                                            .to_str()
-                                            .unwrap_or("");
+                                        let s =
+                                            std::ffi::CStr::from_ptr(utf8).to_str().unwrap_or("");
                                         if s == "Window" {
                                             let _: () = msg_send![
                                                 ns_app,
@@ -343,7 +347,7 @@ pub fn run() {
                             let _ = win_for_close.hide();
                         } else {
                             // Main window is truly closing — close child windows if open.
-                            for label in ["settings", "stats"] {
+                            for label in ["settings", "stats", "pip"] {
                                 if let Some(win) = app_for_close.get_webview_window(label) {
                                     let _ = win.close();
                                 }
@@ -358,13 +362,23 @@ pub fn run() {
                     }
                     tauri::WindowEvent::Resized(size) => {
                         if let Ok(conn) = db_for_pos.lock() {
-                            let _ = settings::save_setting(&conn, "window_width", &size.width.to_string());
-                            let _ = settings::save_setting(&conn, "window_height", &size.height.to_string());
+                            let _ = settings::save_setting(
+                                &conn,
+                                "window_width",
+                                &size.width.to_string(),
+                            );
+                            let _ = settings::save_setting(
+                                &conn,
+                                "window_height",
+                                &size.height.to_string(),
+                            );
                             // Also capture position, since some window managers shift the
                             // window origin when resizing.
                             if let Ok(pos) = win_for_pos.outer_position() {
-                                let _ = settings::save_setting(&conn, "window_x", &pos.x.to_string());
-                                let _ = settings::save_setting(&conn, "window_y", &pos.y.to_string());
+                                let _ =
+                                    settings::save_setting(&conn, "window_x", &pos.x.to_string());
+                                let _ =
+                                    settings::save_setting(&conn, "window_y", &pos.y.to_string());
                             }
                         }
                     }
@@ -381,7 +395,12 @@ pub fn run() {
             timer_restart_round,
             timer_skip,
             timer_get_state,
+            timer_adjust_duration,
             plants_list,
+            plants_save,
+            plants_set_hidden,
+            plants_restore_default,
+            plants_delete,
             plants_select,
             forest_get,
             // Settings

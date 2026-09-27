@@ -1,6 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { getForest, getPlants, onRoundChange, onSessionsCleared } from '$lib/ipc';
+  import {
+    getForest,
+    getPlants,
+    onPlantsChanged,
+    onRoundChange,
+    onSessionsCleared,
+  } from '$lib/ipc';
   import type { ForestData, ForestPeriod, PlantDefinition } from '$lib/types';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import * as m from '$paraglide/messages.js';
@@ -72,16 +78,22 @@
     return mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h ${mins % 60}m`;
   }
 
-  function plantName(id: string): string {
-    return plants.find((plant) => plant.id === id)?.name ?? id;
+  function plantName(id: string, snapshot: string | null): string {
+    return snapshot ?? plants.find((plant) => plant.id === id)?.name ?? id;
   }
 
   onMount(() => {
     const cleanups: UnlistenFn[] = [];
     (async () => {
-      plants = await getPlants();
+      plants = await getPlants(true);
       await load();
-      cleanups.push(await onRoundChange(load), await onSessionsCleared(load));
+      cleanups.push(
+        await onRoundChange(load),
+        await onSessionsCleared(load),
+        await onPlantsChanged(async () => {
+          plants = await getPlants(true);
+        })
+      );
     })();
     return () => cleanups.forEach((cleanup) => cleanup());
   });
@@ -127,9 +139,13 @@
           <div
             class="tree"
             style="--delay: {Math.min(index * 25, 350)}ms"
-            title={`${plantName(entry.plant_id)} · ${durationLabel(entry.duration_secs)}`}
+            title={`${plantName(entry.plant_id, entry.plant_name)} · ${durationLabel(entry.duration_secs)}`}
           >
-            <PlantIllustration plantId={entry.plant_id} stage={entry.growth_stage} />
+            <PlantIllustration
+              plantId={entry.plant_id}
+              iconPath={entry.icon_path}
+              stage={entry.growth_stage}
+            />
           </div>
         {/each}
       </div>

@@ -14,7 +14,7 @@ export interface TimerState {
   work_round_number: number; // current work round (1-based)
   work_rounds_total: number; // total work rounds before long break
   session_work_count: number; // monotonic focus round count since last reset
-  selected_plant_id: string; // selection for the next focus round
+  selected_plant_id: string | null; // selection for the next focus round
   active_plant_id: string | null; // locked plant for the active focus round
 }
 
@@ -27,6 +27,22 @@ export interface PlantDefinition {
   category: string;
   min_focus_secs: number;
   accent: string;
+  is_builtin: boolean;
+  hidden: boolean;
+  small_icon_path: string | null;
+  medium_icon_path: string | null;
+  large_icon_path: string | null;
+}
+
+export interface PlantInput {
+  id: string | null;
+  name: string;
+  category: string;
+  min_focus_secs: number;
+  accent: string;
+  small_icon_source_path: string | null;
+  medium_icon_source_path: string | null;
+  large_icon_source_path: string | null;
 }
 
 export interface ForestEntry {
@@ -36,6 +52,9 @@ export interface ForestEntry {
   duration_secs: number;
   planted_at: number;
   local_date: string;
+  plant_name: string | null;
+  plant_accent: string | null;
+  icon_path: string | null;
 }
 
 export interface ForestData {

@@ -39,7 +39,7 @@ pub struct TimerSnapshot {
     /// session counter when long breaks are disabled.
     pub session_work_count: u32,
     /// Plant chosen for the next focus round.
-    pub selected_plant_id: String,
+    pub selected_plant_id: Option<String>,
     /// Plant locked to the currently active focus round.
     pub active_plant_id: Option<String>,
 }
@@ -50,6 +50,7 @@ pub struct TimerSnapshot {
 
 struct TimerShared {
     elapsed_secs: u32,
+    total_secs: u32,
     is_running: bool,
     active_plant_id: Option<String>,
 }
@@ -63,7 +64,7 @@ pub struct TimerController {
     sequence: Arc<Mutex<SequenceState>>,
     settings: Arc<Mutex<Settings>>,
     shared: Arc<Mutex<TimerShared>>,
-    selected_plant: Arc<Mutex<String>>,
+    selected_plant: Arc<Mutex<Option<String>>>,
     /// Kept alive so TrayState is not dropped if lib.rs forgets its copy.
     #[allow(dead_code)]
     tray: Arc<TrayState>,
@@ -77,7 +78,7 @@ impl TimerController {
         settings: Settings,
         tray: Arc<TrayState>,
         db: DbState,
-        selected_plant_id: String,
+        selected_plant_id: Option<String>,
     ) -> Self {
         let seq = SequenceState::new(settings.long_break_interval);
         let duration = seq.current_duration_secs(&settings);
@@ -88,6 +89,7 @@ impl TimerController {
         let settings_arc = Arc::new(Mutex::new(settings));
         let shared = Arc::new(Mutex::new(TimerShared {
             elapsed_secs: 0,
+            total_secs: duration,
             is_running: false,
             active_plant_id: None,
         }));
@@ -177,6 +179,23 @@ impl TimerController {
         self.engine.send(TimerCommand::WakeResume);
     }
 
+    pub fn adjust_duration(&self, delta_secs: i32) -> Result<(), String> {
+        if delta_secs != -300 && delta_secs != 300 {
+            return Err("duration can only be adjusted by five minutes".to_string());
+        }
+        if self.sequence.lock().unwrap().current_round != RoundType::Work {
+            return Err("only focus rounds can be adjusted".to_string());
+        }
+        let shared = self.shared.lock().unwrap();
+        if delta_secs < 0 && shared.elapsed_secs > 0 {
+            return Err("restart the round before reducing its duration".to_string());
+        }
+        drop(shared);
+        self.engine
+            .send(TimerCommand::AdjustDuration { delta_secs });
+        Ok(())
+    }
+
     /// Update the duration for the current round when settings change.
     /// Only takes effect after the next Start/Resume (current countdown is not interrupted).
     pub fn reconfigure(&self) {
@@ -185,22 +204,26 @@ impl TimerController {
             let settings = self.settings.lock().unwrap();
             seq.current_duration_secs(&settings)
         };
-        self.engine.send(TimerCommand::Reconfigure { duration_secs: duration });
+        self.engine.send(TimerCommand::Reconfigure {
+            duration_secs: duration,
+        });
     }
 
     // --- Query ---
 
     pub fn get_snapshot(&self) -> TimerSnapshot {
         let seq = self.sequence.lock().unwrap();
-        let settings = self.settings.lock().unwrap();
         let shared = self.shared.lock().unwrap();
         let selected_plant = self.selected_plant.lock().unwrap();
 
         TimerSnapshot {
             round_type: seq.current_round.as_str().to_string(),
-            previous_round_type: seq.previous_round.map(|r| r.as_str().to_string()).unwrap_or_default(),
+            previous_round_type: seq
+                .previous_round
+                .map(|r| r.as_str().to_string())
+                .unwrap_or_default(),
             elapsed_secs: shared.elapsed_secs,
-            total_secs: seq.current_duration_secs(&settings),
+            total_secs: shared.total_secs,
             is_running: shared.is_running,
             is_paused: !shared.is_running && shared.elapsed_secs > 0,
             work_round_number: seq.work_round_number,
@@ -211,7 +234,7 @@ impl TimerController {
         }
     }
 
-    pub fn select_plant(&self, plant_id: String) {
+    pub fn select_plant(&self, plant_id: Option<String>) {
         *self.selected_plant.lock().unwrap() = plant_id;
     }
 
@@ -228,8 +251,13 @@ impl TimerController {
         // reflect the new long_break_interval immediately.
         self.sequence.lock().unwrap().work_rounds_total = new.long_break_interval;
         *self.settings.lock().unwrap() = new;
-        let s = self.shared.lock().unwrap();
+        let mut s = self.shared.lock().unwrap();
         let is_idle = !s.is_running && s.elapsed_secs == 0;
+        if is_idle {
+            let seq = self.sequence.lock().unwrap();
+            let settings = self.settings.lock().unwrap();
+            s.total_secs = seq.current_duration_secs(&settings);
+        }
         drop(s);
         if is_idle {
             self.reconfigure();
@@ -245,7 +273,7 @@ struct ListenContext {
     sequence: Arc<Mutex<SequenceState>>,
     settings: Arc<Mutex<Settings>>,
     shared: Arc<Mutex<TimerShared>>,
-    selected_plant: Arc<Mutex<String>>,
+    selected_plant: Arc<Mutex<Option<String>>>,
     engine: EngineHandle,
     tray: Arc<TrayState>,
     db: DbState,
@@ -256,7 +284,15 @@ fn listen_events(
     event_rx: std::sync::mpsc::Receiver<TimerEvent>,
     ctx: ListenContext,
 ) {
-    let ListenContext { sequence, settings, shared, selected_plant, engine, tray, db } = ctx;
+    let ListenContext {
+        sequence,
+        settings,
+        shared,
+        selected_plant,
+        engine,
+        tray,
+        db,
+    } = ctx;
     // Track last tray progress to throttle redraws to ≥ 1% delta.
     let mut last_tray_progress: f32 = -1.0;
     // Active session row ID for recording (None = not started yet).
@@ -270,8 +306,9 @@ fn listen_events(
                 {
                     let mut state = shared.lock().unwrap();
                     state.is_running = true;
+                    state.total_secs = total_secs;
                     state.active_plant_id = if is_work {
-                        Some(selected_plant.lock().unwrap().clone())
+                        selected_plant.lock().unwrap().clone()
                     } else {
                         None
                     };
@@ -284,10 +321,14 @@ fn listen_events(
                 tray::update_menu_items(&tray, true, false);
             }
 
-            TimerEvent::Tick { elapsed_secs, total_secs } => {
+            TimerEvent::Tick {
+                elapsed_secs,
+                total_secs,
+            } => {
                 {
                     let mut s = shared.lock().unwrap();
                     s.elapsed_secs = elapsed_secs;
+                    s.total_secs = total_secs;
                     s.is_running = true;
                 }
                 let _ = app.emit(
@@ -298,13 +339,19 @@ fn listen_events(
                 // --- Session recording: start on first tick of a new round ---
                 if elapsed_secs == 1 && current_session_id.is_none() {
                     let rt = sequence.lock().unwrap().current_round.as_str().to_string();
-                    let plant_id = if rt == "work" {
-                        shared.lock().unwrap().active_plant_id.clone()
-                            .filter(|id| crate::plants::growth_stage(id, total_secs).is_some())
-                    } else {
-                        None
-                    };
                     if let Ok(conn) = db.lock() {
+                        let plant_id = if rt == "work" {
+                            shared.lock().unwrap().active_plant_id.clone().filter(|id| {
+                                crate::plants::find(&conn, id)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|plant| {
+                                        crate::plants::growth_stage(&plant, total_secs).is_some()
+                                    })
+                            })
+                        } else {
+                            None
+                        };
                         match queries::insert_session(&conn, &rt, total_secs, plant_id.as_deref()) {
                             Ok(id) => current_session_id = Some(id),
                             Err(e) => log::error!("[timer] failed to record session: {e}"),
@@ -332,11 +379,11 @@ fn listen_events(
                 }
             }
 
-            TimerEvent::Complete { skipped: was_skipped } => {
+            TimerEvent::Complete {
+                skipped: was_skipped,
+            } => {
                 let completed_round = sequence.lock().unwrap().current_round.as_str().to_string();
-                log::info!(
-                    "[timer] round complete type={completed_round} skipped={was_skipped}"
-                );
+                log::info!("[timer] round complete type={completed_round} skipped={was_skipped}");
 
                 // --- Session recording: mark the completed round ---
                 if let Some(session_id) = current_session_id.take() {
@@ -357,6 +404,7 @@ fn listen_events(
                 {
                     let mut s = shared.lock().unwrap();
                     s.elapsed_secs = 0;
+                    s.total_secs = next_duration;
                     s.is_running = false;
                     s.active_plant_id = None;
                 }
@@ -433,19 +481,22 @@ fn listen_events(
             TimerEvent::Paused { elapsed_secs } => {
                 log::info!("[timer] paused elapsed={elapsed_secs}s");
                 shared.lock().unwrap().is_running = false;
-                let _ = app.emit("timer:paused", serde_json::json!({ "elapsed_secs": elapsed_secs }));
+                let _ = app.emit(
+                    "timer:paused",
+                    serde_json::json!({ "elapsed_secs": elapsed_secs }),
+                );
                 if let Some(ws) = app.try_state::<Arc<WsState>>() {
                     websocket::broadcast_paused(&ws, elapsed_secs);
                 }
 
                 // Show pause bars in tray.
                 let rt = sequence.lock().unwrap().current_round.as_str().to_string();
-                let total = {
-                    let seq = sequence.lock().unwrap();
-                    let s = settings.lock().unwrap();
-                    seq.current_duration_secs(&s)
+                let total = shared.lock().unwrap().total_secs;
+                let progress = if total > 0 {
+                    elapsed_secs as f32 / total as f32
+                } else {
+                    0.0
                 };
-                let progress = if total > 0 { elapsed_secs as f32 / total as f32 } else { 0.0 };
                 tray::update_icon(&tray, &rt, true, progress);
                 tray::update_menu_items(&tray, false, true);
             }
@@ -453,19 +504,22 @@ fn listen_events(
             TimerEvent::Resumed { elapsed_secs } => {
                 log::info!("[timer] resumed elapsed={elapsed_secs}s");
                 shared.lock().unwrap().is_running = true;
-                let _ = app.emit("timer:resumed", serde_json::json!({ "elapsed_secs": elapsed_secs }));
+                let _ = app.emit(
+                    "timer:resumed",
+                    serde_json::json!({ "elapsed_secs": elapsed_secs }),
+                );
                 if let Some(ws) = app.try_state::<Arc<WsState>>() {
                     websocket::broadcast_resumed(&ws, elapsed_secs);
                 }
 
                 // Restore arc in tray.
                 let rt = sequence.lock().unwrap().current_round.as_str().to_string();
-                let total = {
-                    let seq = sequence.lock().unwrap();
-                    let s = settings.lock().unwrap();
-                    seq.current_duration_secs(&s)
+                let total = shared.lock().unwrap().total_secs;
+                let progress = if total > 0 {
+                    elapsed_secs as f32 / total as f32
+                } else {
+                    0.0
                 };
-                let progress = if total > 0 { elapsed_secs as f32 / total as f32 } else { 0.0 };
                 tray::update_icon(&tray, &rt, false, progress);
                 last_tray_progress = progress;
                 tray::update_menu_items(&tray, true, false);
@@ -476,9 +530,15 @@ fn listen_events(
                 // Abandon the active session (leave DB row as-is).
                 current_session_id = None;
 
+                let duration = {
+                    let seq = sequence.lock().unwrap();
+                    let s = settings.lock().unwrap();
+                    seq.current_duration_secs(&s)
+                };
                 {
                     let mut s = shared.lock().unwrap();
                     s.elapsed_secs = 0;
+                    s.total_secs = duration;
                     s.is_running = false;
                     s.active_plant_id = None;
                 }
@@ -493,12 +553,9 @@ fn listen_events(
                 // total. Using the lighter-weight command here avoids a race
                 // where a fast user click on Start is immediately clobbered by
                 // a late follow-up duration update.
-                let duration = {
-                    let seq = sequence.lock().unwrap();
-                    let s = settings.lock().unwrap();
-                    seq.current_duration_secs(&s)
-                };
-                engine.send(TimerCommand::Prime { duration_secs: duration });
+                engine.send(TimerCommand::Prime {
+                    duration_secs: duration,
+                });
 
                 // Reset tray to idle (empty arc).
                 let rt = sequence.lock().unwrap().current_round.as_str().to_string();
@@ -517,13 +574,65 @@ fn listen_events(
 
                 // Show pause bars while suspended.
                 let rt = sequence.lock().unwrap().current_round.as_str().to_string();
-                let total = {
-                    let seq = sequence.lock().unwrap();
-                    let s = settings.lock().unwrap();
-                    seq.current_duration_secs(&s)
+                let total = shared.lock().unwrap().total_secs;
+                let progress = if total > 0 {
+                    elapsed_secs as f32 / total as f32
+                } else {
+                    0.0
                 };
-                let progress = if total > 0 { elapsed_secs as f32 / total as f32 } else { 0.0 };
                 tray::update_icon(&tray, &rt, true, progress);
+            }
+            TimerEvent::DurationAdjusted { total_secs } => {
+                let should_revalidate_selection = {
+                    let mut state = shared.lock().unwrap();
+                    state.total_secs = total_secs;
+                    !state.is_running && state.elapsed_secs == 0 && state.active_plant_id.is_none()
+                };
+                if should_revalidate_selection {
+                    if let Ok(conn) = db.lock() {
+                        let selected = selected_plant.lock().unwrap().clone();
+                        let remains_valid = selected.as_deref().is_none_or(|id| {
+                            crate::plants::find(&conn, id)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|plant| {
+                                    !plant.hidden
+                                        && crate::plants::growth_stage(&plant, total_secs).is_some()
+                                })
+                        });
+                        if !remains_valid {
+                            let _ = crate::settings::save_setting(&conn, "selected_plant_id", "");
+                            *selected_plant.lock().unwrap() = None;
+                        }
+                    }
+                }
+                if let Some(session_id) = current_session_id {
+                    if let Ok(conn) = db.lock() {
+                        let plant_id =
+                            shared.lock().unwrap().active_plant_id.clone().filter(|id| {
+                                crate::plants::find(&conn, id)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|plant| {
+                                        crate::plants::growth_stage(&plant, total_secs).is_some()
+                                    })
+                            });
+                        let _ = queries::update_session_duration(
+                            &conn,
+                            session_id,
+                            total_secs,
+                            plant_id.as_deref(),
+                        );
+                    }
+                }
+                let snapshot = build_snapshot(&sequence, &settings, &shared, &selected_plant);
+                let _ = app.emit("timer:duration-adjusted", &snapshot);
+                let progress = if total_secs > 0 {
+                    snapshot.elapsed_secs as f32 / total_secs as f32
+                } else {
+                    0.0
+                };
+                tray::update_icon(&tray, &snapshot.round_type, snapshot.is_paused, progress);
             }
         }
     }
@@ -531,20 +640,22 @@ fn listen_events(
 
 fn build_snapshot(
     sequence: &Arc<Mutex<SequenceState>>,
-    settings: &Arc<Mutex<Settings>>,
+    _settings: &Arc<Mutex<Settings>>,
     shared: &Arc<Mutex<TimerShared>>,
-    selected_plant: &Arc<Mutex<String>>,
+    selected_plant: &Arc<Mutex<Option<String>>>,
 ) -> TimerSnapshot {
     let seq = sequence.lock().unwrap();
-    let s = settings.lock().unwrap();
     let sh = shared.lock().unwrap();
     let plant = selected_plant.lock().unwrap();
 
     TimerSnapshot {
         round_type: seq.current_round.as_str().to_string(),
-        previous_round_type: seq.previous_round.map(|r| r.as_str().to_string()).unwrap_or_default(),
+        previous_round_type: seq
+            .previous_round
+            .map(|r| r.as_str().to_string())
+            .unwrap_or_default(),
         elapsed_secs: sh.elapsed_secs,
-        total_secs: seq.current_duration_secs(&s),
+        total_secs: sh.total_secs,
         is_running: sh.is_running,
         is_paused: !sh.is_running && sh.elapsed_secs > 0,
         work_round_number: seq.work_round_number,

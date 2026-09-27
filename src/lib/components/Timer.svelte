@@ -10,11 +10,14 @@
     onTimerResumed,
     onTimerStarted,
     onTimerTick,
+    onTimerDurationAdjusted,
+    onPlantsChanged,
     selectPlant,
     timerReset,
     timerRestartRound,
     timerSkip,
     timerToggle,
+    timerAdjustDuration,
   } from '$lib/ipc';
   import { timerState } from '$lib/stores/timer';
   import { settings } from '$lib/stores/settings';
@@ -22,6 +25,7 @@
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import * as m from '$paraglide/messages.js';
   import PlantIllustration from './PlantIllustration.svelte';
+  import PlantManager from './PlantManager.svelte';
 
   interface Props {
     isCompact?: boolean;
@@ -33,6 +37,7 @@
   let showPicker = $state(false);
   let showClock = $state(true);
   let selecting = $state(false);
+  let showManager = $state(false);
   let snapshot = $derived($timerState);
   let selectedPlant = $derived(plants.find((plant) => plant.id === snapshot.selected_plant_id));
   let displayPlantId = $derived(snapshot.active_plant_id ?? snapshot.selected_plant_id);
@@ -42,10 +47,22 @@
       ? Math.min(1, snapshot.elapsed_secs / Math.max(1, snapshot.total_secs))
       : 0.18
   );
+  let displayIconPath = $derived(
+    !displayPlant
+      ? null
+      : progress < 0.45
+        ? displayPlant.small_icon_path
+        : progress < 0.78
+          ? displayPlant.medium_icon_path
+          : displayPlant.large_icon_path
+  );
   let isGrowing = $derived(
     snapshot.round_type === 'work' && (snapshot.is_running || snapshot.is_paused)
   );
   let selectingNext = $derived(Boolean(snapshot.active_plant_id));
+  let plantEligibilitySecs = $derived(
+    selectingNext ? $settings.time_work_secs : snapshot.total_secs
+  );
 
   function formatTime(seconds: number): string {
     const mins = Math.floor(seconds / 60);
@@ -64,10 +81,21 @@
   }
 
   async function choosePlant(plant: PlantDefinition) {
-    if (plant.min_focus_secs > $settings.time_work_secs || selecting) return;
+    if (plant.min_focus_secs > plantEligibilitySecs || selecting) return;
     selecting = true;
     try {
       timerState.set(await selectPlant(plant.id));
+      showPicker = false;
+    } finally {
+      selecting = false;
+    }
+  }
+
+  async function chooseNoPlant() {
+    if (selecting) return;
+    selecting = true;
+    try {
+      timerState.set(await selectPlant(null));
       showPicker = false;
     } finally {
       selecting = false;
@@ -129,7 +157,9 @@
             ).catch(() => {});
           }
         }),
-        await onTimerReset((snapshot) => timerState.set(snapshot))
+        await onTimerReset((snapshot) => timerState.set(snapshot)),
+        await onTimerDurationAdjusted((snapshot) => timerState.set(snapshot)),
+        await onPlantsChanged((catalog) => (plants = catalog))
       );
     })();
 
@@ -174,14 +204,39 @@
     </header>
 
     {#if showClock}
-      <button class="clock" onclick={() => (showClock = false)} aria-label={m.plant_hide_clock()}>
-        {formatTime(Math.max(0, snapshot.total_secs - snapshot.elapsed_secs))}
-      </button>
+      <div class="clock-row">
+        {#if snapshot.round_type === 'work'}
+          <button
+            class="time-adjust"
+            disabled={snapshot.elapsed_secs > 0 || snapshot.total_secs < 360}
+            onclick={() => timerAdjustDuration(-300)}
+            aria-label={m.timer_reduce_focus()}>-5</button
+          >
+        {/if}
+        <button class="clock" onclick={() => (showClock = false)} aria-label={m.plant_hide_clock()}>
+          {formatTime(Math.max(0, snapshot.total_secs - snapshot.elapsed_secs))}
+        </button>
+        {#if snapshot.round_type === 'work'}
+          <button
+            class="time-adjust"
+            disabled={snapshot.total_secs > 5100}
+            onclick={() => timerAdjustDuration(300)}
+            aria-label={m.timer_add_focus()}>+5</button
+          >
+        {/if}
+      </div>
     {/if}
 
-    <div class="plant-stage" class:growing={snapshot.is_running}>
-      <PlantIllustration plantId={displayPlantId} {progress} label={displayPlant?.name} />
-    </div>
+    {#if displayPlantId}
+      <div class="plant-stage" class:growing={snapshot.is_running}>
+        <PlantIllustration
+          plantId={displayPlantId}
+          iconPath={displayIconPath}
+          {progress}
+          label={displayPlant?.name}
+        />
+      </div>
+    {/if}
 
     <div class="soil-line"></div>
     <div class="progress-track">
@@ -194,7 +249,7 @@
       <span class="seed-dot" style="--seed-color: {selectedPlant?.accent ?? '#77b255'}"></span>
       <span>
         <small>{selectingNext ? m.plant_next_label() : m.plant_selected_label()}</small>
-        <strong>{selectedPlant?.name ?? m.plant_loading()}</strong>
+        <strong>{selectedPlant?.name ?? m.plant_none()}</strong>
       </span>
       <svg viewBox="0 0 24 24"><path d="m8 10 4 4 4-4" /></svg>
     </button>
@@ -249,16 +304,33 @@
         </div>
         <button onclick={() => (showPicker = false)} aria-label="Close">×</button>
       </div>
+      <div class="picker-actions">
+        <button class:selected={snapshot.selected_plant_id === null} onclick={chooseNoPlant}
+          >{m.plant_none()}</button
+        >
+        <button
+          onclick={() => {
+            showPicker = false;
+            showManager = true;
+          }}>{m.plant_manage()}</button
+        >
+      </div>
       <div class="plant-grid">
         {#each plants as plant}
-          {@const locked = plant.min_focus_secs > $settings.time_work_secs}
+          {@const locked = plant.min_focus_secs > plantEligibilitySecs}
           <button
             class:selected={plant.id === snapshot.selected_plant_id}
             class:locked
             disabled={locked || selecting}
             onclick={() => choosePlant(plant)}
           >
-            <span class="plant-thumb"><PlantIllustration plantId={plant.id} progress={1} /></span>
+            <span class="plant-thumb"
+              ><PlantIllustration
+                plantId={plant.id}
+                iconPath={plant.large_icon_path}
+                progress={1}
+              /></span
+            >
             <strong>{plant.name}</strong>
             <small
               >{locked
@@ -269,6 +341,9 @@
         {/each}
       </div>
     </section>
+  {/if}
+  {#if showManager}
+    <PlantManager activePlantId={snapshot.active_plant_id} onclose={() => (showManager = false)} />
   {/if}
 </div>
 
@@ -405,12 +480,17 @@
     stroke: currentColor;
     stroke-width: 1.7;
   }
-  .clock {
+  .clock-row {
     position: absolute;
     z-index: 4;
     left: 50%;
     top: 56px;
     transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .clock {
     border: 0;
     background: none;
     color: inherit;
@@ -420,6 +500,19 @@
     letter-spacing: 0.04em;
     cursor: pointer;
     text-shadow: 0 2px 14px color-mix(in oklch, var(--color-background) 50%, transparent);
+  }
+  .time-adjust {
+    border: 0;
+    border-radius: 10px;
+    padding: 4px 6px;
+    color: inherit;
+    background: color-mix(in oklch, var(--color-background) 30%, transparent);
+    font: 700 9px/1 'Mona Sans';
+    cursor: pointer;
+  }
+  .time-adjust:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
   }
   .plant-stage {
     position: absolute;
@@ -620,12 +713,30 @@
     cursor: pointer;
   }
   .plant-grid {
-    height: 275px;
+    height: 236px;
     overflow-y: auto;
     display: grid;
     grid-template-columns: repeat(2, 1fr);
     gap: 7px;
     padding-right: 2px;
+  }
+  .picker-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    margin-bottom: 7px;
+  }
+  .picker-actions button {
+    border: 1px solid var(--color-separator);
+    border-radius: 8px;
+    padding: 6px;
+    color: inherit;
+    background: var(--color-hover);
+    font-size: 9px;
+    cursor: pointer;
+  }
+  .picker-actions button.selected {
+    border-color: var(--color-accent);
   }
   .plant-grid button {
     min-height: 102px;
@@ -669,7 +780,7 @@
     height: 170px;
   }
   .compact .garden-header,
-  .compact .clock,
+  .compact .clock-row,
   .compact .plant-choice,
   .compact footer {
     display: none;

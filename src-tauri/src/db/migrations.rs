@@ -101,6 +101,39 @@ const MIGRATION_7: &str = "
     INSERT INTO schema_version VALUES (7);
 ";
 
+/// Adds editable plant definitions and immutable display snapshots for forest entries.
+const MIGRATION_8: &str = "
+    CREATE TABLE plant_overrides (
+        id               TEXT PRIMARY KEY NOT NULL,
+        name             TEXT NOT NULL,
+        category         TEXT NOT NULL,
+        min_focus_secs   INTEGER NOT NULL CHECK(min_focus_secs > 0),
+        accent           TEXT NOT NULL,
+        hidden           INTEGER NOT NULL DEFAULT 0 CHECK(hidden IN (0, 1)),
+        small_icon_path  TEXT,
+        medium_icon_path TEXT,
+        large_icon_path  TEXT
+    );
+
+    CREATE TABLE custom_plants (
+        id               TEXT PRIMARY KEY NOT NULL,
+        name             TEXT NOT NULL,
+        category         TEXT NOT NULL,
+        min_focus_secs   INTEGER NOT NULL CHECK(min_focus_secs > 0),
+        accent           TEXT NOT NULL,
+        hidden           INTEGER NOT NULL DEFAULT 0 CHECK(hidden IN (0, 1)),
+        small_icon_path  TEXT NOT NULL,
+        medium_icon_path TEXT NOT NULL,
+        large_icon_path  TEXT NOT NULL
+    );
+
+    ALTER TABLE sessions ADD COLUMN plant_name TEXT;
+    ALTER TABLE sessions ADD COLUMN plant_accent TEXT;
+    ALTER TABLE sessions ADD COLUMN plant_icon_path TEXT;
+
+    INSERT INTO schema_version VALUES (8);
+";
+
 /// Apply any pending migrations. Each migration is wrapped in a transaction
 /// so a partial failure leaves the database unchanged.
 pub fn run(conn: &Connection) -> Result<()> {
@@ -148,6 +181,12 @@ pub fn run(conn: &Connection) -> Result<()> {
         log::info!("[db/migrations] MIGRATION_7 complete");
     }
 
+    if version < 8 {
+        log::info!("[db/migrations] applying MIGRATION_8: managed plants and session snapshots");
+        conn.execute_batch(&format!("BEGIN; {MIGRATION_8} COMMIT;"))?;
+        log::info!("[db/migrations] MIGRATION_8 complete");
+    }
+
     Ok(())
 }
 
@@ -183,14 +222,21 @@ mod tests {
         let v: i64 = conn
             .query_row("SELECT MAX(version) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 7);
+        assert_eq!(v, 8);
     }
 
     #[test]
     fn all_tables_created() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
-        for table in &["settings", "sessions", "custom_themes", "schema_version"] {
+        for table in &[
+            "settings",
+            "sessions",
+            "custom_themes",
+            "plant_overrides",
+            "custom_plants",
+            "schema_version",
+        ] {
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -199,6 +245,17 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(count, 1, "table '{table}' was not created");
+        }
+
+        for column in &["plant_name", "plant_accent", "plant_icon_path"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = ?1",
+                    [column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "sessions column '{column}' was not created");
         }
     }
 }

@@ -25,11 +25,7 @@ pub fn insert_session(
 }
 
 /// Updates a session when the round ends (by completion or skip).
-pub fn complete_session(
-    conn: &Connection,
-    session_id: i64,
-    completed: bool,
-) -> Result<()> {
+pub fn complete_session(conn: &Connection, session_id: i64, completed: bool) -> Result<()> {
     let plant: Option<(String, u32)> = conn
         .query_row(
             "SELECT plant_id, duration_secs FROM sessions WHERE id = ?1 AND plant_id IS NOT NULL",
@@ -37,18 +33,57 @@ pub fn complete_session(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .ok();
+    let definition = plant
+        .as_ref()
+        .and_then(|(id, _)| crate::plants::find(conn, id).ok().flatten());
     let growth_stage = if completed {
-        plant
-            .as_ref()
-            .and_then(|(id, duration)| crate::plants::growth_stage(id, *duration))
+        plant.as_ref().and_then(|(_, duration)| {
+            definition
+                .as_ref()
+                .and_then(|plant| crate::plants::growth_stage(plant, *duration))
+        })
     } else {
         None
     };
+    let plant_name = growth_stage.and_then(|_| definition.as_ref().map(|plant| plant.name.clone()));
+    let plant_accent =
+        growth_stage.and_then(|_| definition.as_ref().map(|plant| plant.accent.clone()));
+    let icon_path = growth_stage.and_then(|stage| {
+        definition
+            .as_ref()
+            .and_then(|plant| crate::plants::stage_icon_path(plant, stage))
+    });
     conn.execute(
-        "UPDATE sessions SET ended_at = ?1, completed = ?2, growth_stage = ?3 WHERE id = ?4",
-        params![unix_now(), completed as i64, growth_stage, session_id],
+        "UPDATE sessions
+         SET ended_at = ?1, completed = ?2, growth_stage = ?3,
+             plant_name = ?4, plant_accent = ?5, plant_icon_path = ?6
+         WHERE id = ?7",
+        params![
+            unix_now(),
+            completed as i64,
+            growth_stage,
+            plant_name,
+            plant_accent,
+            icon_path,
+            session_id
+        ],
     )?;
     log::debug!("[db] session ended: id={session_id} completed={completed}");
+    Ok(())
+}
+
+pub fn update_session_duration(
+    conn: &Connection,
+    session_id: i64,
+    duration_secs: u32,
+    plant_id: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions
+         SET duration_secs = ?1, plant_id = ?2
+         WHERE id = ?3 AND completed = 0",
+        params![duration_secs, plant_id, session_id],
+    )?;
     Ok(())
 }
 
@@ -60,6 +95,9 @@ pub struct ForestEntry {
     pub duration_secs: u32,
     pub planted_at: i64,
     pub local_date: String,
+    pub plant_name: Option<String>,
+    pub plant_accent: Option<String>,
+    pub icon_path: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,11 +121,9 @@ pub fn get_forest(conn: &Connection, period: &str, anchor: Option<&str>) -> Resu
 
     let start_date: String = if period == "week" {
         // Move to the coming Sunday, then step back to Monday of this week.
-        conn.query_row(
-            "SELECT date(?1, 'weekday 0', '-6 days')",
-            [anchor],
-            |row| row.get(0),
-        )?
+        conn.query_row("SELECT date(?1, 'weekday 0', '-6 days')", [anchor], |row| {
+            row.get(0)
+        })?
     } else {
         conn.query_row(
             "SELECT date(?1, ?2)",
@@ -103,7 +139,8 @@ pub fn get_forest(conn: &Connection, period: &str, anchor: Option<&str>) -> Resu
 
     let mut stmt = conn.prepare(
         "SELECT id, plant_id, growth_stage, duration_secs, ended_at,
-                date(ended_at, 'unixepoch', 'localtime')
+                date(ended_at, 'unixepoch', 'localtime'),
+                plant_name, plant_accent, plant_icon_path
          FROM sessions
          WHERE round_type = 'work' AND completed = 1
            AND plant_id IS NOT NULL AND growth_stage IS NOT NULL
@@ -120,10 +157,21 @@ pub fn get_forest(conn: &Connection, period: &str, anchor: Option<&str>) -> Resu
                 duration_secs: row.get(3)?,
                 planted_at: row.get(4)?,
                 local_date: row.get(5)?,
+                plant_name: row.get(6)?,
+                plant_accent: row.get(7)?,
+                icon_path: row.get(8)?,
             })
         })?
         .collect::<Result<Vec<_>>>()?;
-    let total_focus_secs = entries.iter().map(|entry| entry.duration_secs).sum();
+    let total_focus_secs = conn.query_row(
+        "SELECT COALESCE(SUM(duration_secs), 0)
+         FROM sessions
+         WHERE round_type = 'work' AND completed = 1
+           AND date(ended_at, 'unixepoch', 'localtime') >= ?1
+           AND date(ended_at, 'unixepoch', 'localtime') < ?2",
+        params![&start_date, &end_date],
+        |row| row.get(0),
+    )?;
 
     Ok(ForestData {
         period: period.to_string(),
@@ -209,11 +257,7 @@ pub struct StreakInfo {
 
 /// Completed work rounds and focus time for today (local calendar date).
 pub fn get_daily_stats(conn: &Connection) -> Result<DailyStats> {
-    let today: String = conn.query_row(
-        "SELECT date('now', 'localtime')",
-        [],
-        |r| r.get(0),
-    )?;
+    let today: String = conn.query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))?;
 
     let total: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sessions
@@ -259,7 +303,11 @@ pub fn get_daily_stats(conn: &Connection) -> Result<DailyStats> {
     Ok(DailyStats {
         rounds: completed as u32,
         focus_mins: ((focus_secs + 30) / 60) as u32,
-        completion_rate: if total > 0 { Some(completed as f32 / total as f32) } else { None },
+        completion_rate: if total > 0 {
+            Some(completed as f32 / total as f32)
+        } else {
+            None
+        },
         by_hour,
     })
 }
@@ -275,7 +323,13 @@ pub fn get_weekly_stats(conn: &Connection) -> Result<Vec<DayStat>> {
          GROUP BY day
          ORDER BY day",
     )?;
-    let rows = stmt.query_map([], |r| Ok(DayStat { date: r.get(0)?, rounds: r.get(1)? }))?
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(DayStat {
+                date: r.get(0)?,
+                rounds: r.get(1)?,
+            })
+        })?
         .collect();
     rows
 }
@@ -291,7 +345,13 @@ pub fn get_heatmap_data(conn: &Connection) -> Result<Vec<HeatmapEntry>> {
          GROUP BY day
          ORDER BY day",
     )?;
-    let rows = stmt.query_map([], |r| Ok(HeatmapEntry { date: r.get(0)?, count: r.get(1)? }))?
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(HeatmapEntry {
+                date: r.get(0)?,
+                count: r.get(1)?,
+            })
+        })?
         .collect();
     rows
 }
@@ -300,11 +360,7 @@ pub fn get_heatmap_data(conn: &Connection) -> Result<Vec<HeatmapEntry>> {
 /// A streak stays active until midnight: if yesterday had sessions but today does not,
 /// the streak is still counted as current.
 pub fn get_streak(conn: &Connection) -> Result<StreakInfo> {
-    let today: String = conn.query_row(
-        "SELECT date('now', 'localtime')",
-        [],
-        |r| r.get(0),
-    )?;
+    let today: String = conn.query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))?;
 
     let mut stmt = conn.prepare(
         "SELECT date(started_at, 'unixepoch', 'localtime') as day
@@ -313,10 +369,7 @@ pub fn get_streak(conn: &Connection) -> Result<StreakInfo> {
          GROUP BY day
          ORDER BY day",
     )?;
-    let days: Vec<String> = stmt
-        .query_map([], |r| r.get(0))?
-        .flatten()
-        .collect();
+    let days: Vec<String> = stmt.query_map([], |r| r.get(0))?.flatten().collect();
 
     Ok(compute_streak(&days, &today))
 }
@@ -341,12 +394,20 @@ fn date_to_day_num(s: &str) -> Option<i32> {
 pub fn compute_streak(days: &[String], today: &str) -> StreakInfo {
     let nums: Vec<i32> = days.iter().filter_map(|s| date_to_day_num(s)).collect();
     if nums.is_empty() {
-        return StreakInfo { current: 0, longest: 0 };
+        return StreakInfo {
+            current: 0,
+            longest: 0,
+        };
     }
 
     let today_n = match date_to_day_num(today) {
         Some(n) => n,
-        None => return StreakInfo { current: 0, longest: 0 },
+        None => {
+            return StreakInfo {
+                current: 0,
+                longest: 0,
+            }
+        }
     };
 
     // Current streak — alive if most recent session day is today or yesterday.
@@ -373,7 +434,9 @@ pub fn compute_streak(days: &[String], today: &str) -> StreakInfo {
     for i in 1..nums.len() {
         if nums[i] == nums[i - 1] + 1 {
             run += 1;
-            if run > longest { longest = run; }
+            if run > longest {
+                longest = run;
+            }
         } else {
             run = 1;
         }
@@ -413,11 +476,9 @@ mod tests {
         complete_session(&conn, id, true).unwrap();
 
         let completed: i64 = conn
-            .query_row(
-                "SELECT completed FROM sessions WHERE id = ?1",
-                [id],
-                |r| r.get(0),
-            )
+            .query_row("SELECT completed FROM sessions WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(completed, 1);
     }
@@ -440,7 +501,11 @@ mod tests {
 
     #[test]
     fn compute_streak_active_today() {
-        let days = vec!["2024-03-13".to_string(), "2024-03-14".to_string(), "2024-03-15".to_string()];
+        let days = vec![
+            "2024-03-13".to_string(),
+            "2024-03-14".to_string(),
+            "2024-03-15".to_string(),
+        ];
         let info = compute_streak(&days, "2024-03-15");
         assert_eq!(info.current, 3);
         assert_eq!(info.longest, 3);
@@ -465,8 +530,11 @@ mod tests {
     #[test]
     fn compute_streak_longest_across_break() {
         let days = vec![
-            "2024-03-01".to_string(), "2024-03-02".to_string(), "2024-03-03".to_string(),
-            "2024-03-10".to_string(), "2024-03-11".to_string(),
+            "2024-03-01".to_string(),
+            "2024-03-02".to_string(),
+            "2024-03-03".to_string(),
+            "2024-03-10".to_string(),
+            "2024-03-11".to_string(),
         ];
         let info = compute_streak(&days, "2024-03-11");
         assert_eq!(info.current, 2);
@@ -557,6 +625,11 @@ mod tests {
         assert_eq!(forest.entries.len(), 1);
         assert_eq!(forest.entries[0].plant_id, "cherry");
         assert_eq!(forest.entries[0].growth_stage, "medium");
+        assert_eq!(
+            forest.entries[0].plant_name.as_deref(),
+            Some("Cherry Blossom")
+        );
+        assert_eq!(forest.entries[0].plant_accent.as_deref(), Some("#e99aaa"));
         assert_eq!(forest.total_focus_secs, 1500);
     }
 }

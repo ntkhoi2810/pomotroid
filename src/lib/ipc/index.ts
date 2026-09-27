@@ -15,6 +15,7 @@ import type {
   PlantDefinition,
   ForestData,
   ForestPeriod,
+  PlantInput,
 } from '$lib/types';
 
 // --- Timer commands ---
@@ -24,11 +25,26 @@ export const timerReset = () => invoke<void>('timer_reset');
 export const timerRestartRound = () => invoke<void>('timer_restart_round');
 export const timerSkip = () => invoke<void>('timer_skip');
 export const getTimerState = () => invoke<TimerState>('timer_get_state');
+export const timerAdjustDuration = (deltaSecs: -300 | 300) =>
+  invoke<void>('timer_adjust_duration', { deltaSecs });
 
 // --- Plants and forest ---
 
-export const getPlants = () => invoke<PlantDefinition[]>('plants_list');
-export const selectPlant = (plantId: string) => invoke<TimerState>('plants_select', { plantId });
+export const getPlants = (includeHidden = false) =>
+  invoke<PlantDefinition[]>('plants_list', { includeHidden });
+export const selectPlant = (plantId: string | null) =>
+  invoke<TimerState>('plants_select', { plantId });
+export const savePlant = (input: PlantInput) => invoke<PlantDefinition>('plants_save', { input });
+export const setPlantHidden = (plantId: string, hidden: boolean) =>
+  invoke<void>('plants_set_hidden', { plantId, hidden });
+export const restorePlantDefault = (plantId: string) =>
+  invoke<void>('plants_restore_default', { plantId });
+export const deletePlant = (plantId: string) => invoke<void>('plants_delete', { plantId });
+export const openPlantImagePicker = (): Promise<string | null> =>
+  dialogOpen({
+    multiple: false,
+    filters: [{ name: 'Plant image', extensions: ['png', 'webp'] }],
+  }) as Promise<string | null>;
 export const getForest = (period: ForestPeriod, anchor?: string) =>
   invoke<ForestData>('forest_get', { period, anchor: anchor ?? null });
 
@@ -137,11 +153,17 @@ export const onRoundChange = (cb: (state: TimerState) => void): Promise<Unlisten
 export const onTimerReset = (cb: (state: TimerState) => void): Promise<UnlistenFn> =>
   listen<TimerState>('timer:reset', (e) => cb(e.payload));
 
+export const onTimerDurationAdjusted = (cb: (state: TimerState) => void): Promise<UnlistenFn> =>
+  listen<TimerState>('timer:duration-adjusted', (e) => cb(e.payload));
+
 export const onSettingsChanged = (cb: (settings: Settings) => void): Promise<UnlistenFn> =>
   listen<Settings>('settings:changed', (e) => cb(e.payload));
 
 export const onThemesChanged = (cb: (themes: Theme[]) => void): Promise<UnlistenFn> =>
   listen<Theme[]>('themes:changed', (e) => cb(e.payload));
+
+export const onPlantsChanged = (cb: (plants: PlantDefinition[]) => void): Promise<UnlistenFn> =>
+  listen<PlantDefinition[]>('plants:changed', (e) => cb(e.payload));
 
 export const onSessionsCleared = (cb: () => void): Promise<UnlistenFn> =>
   listen<void>('sessions:cleared', () => cb());
